@@ -46,6 +46,25 @@ type grokQuotaHandlerUpstream struct {
 	lastBody []byte
 }
 
+type grokSSOHandlerOAuthClient struct{}
+
+func (grokSSOHandlerOAuthClient) ExchangeCode(context.Context, string, string, string, string, string) (*xai.TokenResponse, error) {
+	return nil, nil
+}
+
+func (grokSSOHandlerOAuthClient) RefreshToken(context.Context, string, string, string) (*xai.TokenResponse, error) {
+	return nil, nil
+}
+
+func (grokSSOHandlerOAuthClient) ConvertSSOToBuild(context.Context, string, string) (*xai.TokenResponse, error) {
+	return &xai.TokenResponse{
+		AccessToken:  "access-token",
+		RefreshToken: "refresh-token",
+		TokenType:    "Bearer",
+		ExpiresIn:    3600,
+	}, nil
+}
+
 func (u *grokQuotaHandlerUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
 	u.lastReq = req
 	if req.Body != nil {
@@ -175,4 +194,69 @@ func TestGrokChatPreflightRejectsMissingChatPermission(t *testing.T) {
 	require.False(t, result.Usable)
 	require.Equal(t, http.StatusForbidden, result.StatusCode)
 	require.Equal(t, "GROK_PREFLIGHT_CHAT_PERMISSION_DENIED", result.Reason)
+}
+
+func TestGrokSSOImportDoesNotCreateAccountWhenChatPreflightFails(t *testing.T) {
+	oauthService := service.NewGrokOAuthService(nil, grokSSOHandlerOAuthClient{})
+	defer oauthService.Stop()
+	upstream := &grokQuotaHandlerUpstream{resp: &http.Response{
+		StatusCode: http.StatusForbidden,
+		Body:       io.NopCloser(strings.NewReader(`{"error":"permission-denied"}`)),
+	}}
+	handler := NewGrokOAuthHandler(oauthService, nil, nil, upstream)
+
+	result := handler.createAccountFromSSOToken(context.Background(), GrokSSOToOAuthRequest{}, "sso-token", 1, 1)
+
+	require.False(t, result.created)
+	require.Nil(t, result.item.Account)
+	require.NotNil(t, result.item.Preflight)
+	require.Equal(t, "GROK_PREFLIGHT_CHAT_PERMISSION_DENIED", result.item.Error)
+}
+
+func TestGrokSSOImportExpiryUsesTokenExpiryWithoutRefreshToken(t *testing.T) {
+	tokenExpiry := time.Now().Add(6 * time.Hour).Unix()
+	expiresAt, autoPause := grokSSOImportExpiry(nil, nil, &service.GrokTokenInfo{
+		ExpiresAt: tokenExpiry,
+	})
+
+	require.NotNil(t, expiresAt)
+	require.Equal(t, tokenExpiry, *expiresAt)
+	require.NotNil(t, autoPause)
+	require.True(t, *autoPause)
+}
+
+func TestGrokSSOImportExpiryUsesEarlierRequestedExpiryWithoutRefreshToken(t *testing.T) {
+	requestedExpiry := time.Now().Add(2 * time.Hour).Unix()
+	tokenExpiry := time.Now().Add(6 * time.Hour).Unix()
+	requestedAutoPause := false
+	expiresAt, autoPause := grokSSOImportExpiry(&requestedExpiry, &requestedAutoPause, &service.GrokTokenInfo{
+		ExpiresAt: tokenExpiry,
+	})
+
+	require.NotNil(t, expiresAt)
+	require.Equal(t, requestedExpiry, *expiresAt)
+	require.NotNil(t, autoPause)
+	require.True(t, *autoPause)
+}
+
+func TestGrokSSOImportExpiryPreservesRequestSettingsWithRefreshToken(t *testing.T) {
+	requestedExpiry := time.Now().Add(2 * time.Hour).Unix()
+	requestedAutoPause := false
+	expiresAt, autoPause := grokSSOImportExpiry(&requestedExpiry, &requestedAutoPause, &service.GrokTokenInfo{
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(6 * time.Hour).Unix(),
+	})
+
+	require.Same(t, &requestedExpiry, expiresAt)
+	require.Same(t, &requestedAutoPause, autoPause)
+}
+
+func TestGrokSSOImportWorkerRecoversPanic(t *testing.T) {
+	h := &GrokOAuthHandler{}
+	result := h.safeCreateAccountFromSSOToken(context.Background(), GrokSSOToOAuthRequest{}, "token", 2, 3)
+	// Without a service, createAccountFromSSOToken would panic on nil service access.
+	// Recovery must convert that into a failed item and keep the worker alive.
+	require.False(t, result.created)
+	require.Equal(t, 2, result.item.Index)
+	require.Contains(t, result.item.Error, "internal worker panic")
 }

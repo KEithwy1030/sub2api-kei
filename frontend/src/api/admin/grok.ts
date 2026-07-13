@@ -34,6 +34,8 @@ export interface GrokTokenInfo {
   scope?: string
   client_id?: string
   email?: string
+  sub?: string
+  team_id?: string
   subscription_tier?: string
   entitlement_status?: string
   [key: string]: unknown
@@ -49,6 +51,56 @@ export interface GrokChatPreflightResult {
 export interface GrokRefreshTokenResult {
   token_info: GrokTokenInfo
   preflight: GrokChatPreflightResult
+}
+
+export interface GrokSSOToOAuthRequest {
+  sso_tokens: string[]
+  name?: string
+  notes?: string | null
+  proxy_id?: number | null
+  group_ids?: number[]
+  credentials?: Record<string, unknown>
+  extra?: Record<string, unknown>
+  concurrency?: number
+  load_factor?: number
+  priority?: number
+  rate_multiplier?: number
+  expires_at?: number | null
+  auto_pause_on_expired?: boolean
+}
+
+export interface GrokSSOToOAuthItemResult {
+  index: number
+  name?: string
+  email?: string
+  account?: unknown
+  preflight?: GrokChatPreflightResult
+  error?: string
+}
+
+export interface GrokSSOToOAuthResponse {
+  created: GrokSSOToOAuthItemResult[]
+  failed: GrokSSOToOAuthItemResult[]
+}
+
+const GROK_SSO_IMPORT_CONCURRENCY = 3
+const GROK_SSO_IMPORT_TIMEOUT_PER_BATCH_MS = 125_000
+const GROK_SSO_IMPORT_TIMEOUT_BUFFER_MS = 90_000
+
+export function getGrokSSOImportTimeout(keyCount: number): number {
+  const batches = Math.ceil(Math.max(1, keyCount) / GROK_SSO_IMPORT_CONCURRENCY)
+  return batches * GROK_SSO_IMPORT_TIMEOUT_PER_BATCH_MS + GROK_SSO_IMPORT_TIMEOUT_BUFFER_MS
+}
+
+export function parseGrokSSOInput(input: string): string[] {
+  return input
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const accountLine = line.match(/----(eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+)$/)
+      return accountLine?.[1] || line
+    })
 }
 
 export interface GrokQuotaWindow {
@@ -131,4 +183,13 @@ export async function resetQuota(id: number): Promise<GrokQuotaResetResult> {
   return data
 }
 
-export default { generateAuthUrl, exchangeCode, refreshGrokToken, queryQuota, resetQuota }
+export async function createFromSSO(payload: GrokSSOToOAuthRequest): Promise<GrokSSOToOAuthResponse> {
+  const { data } = await apiClient.post<GrokSSOToOAuthResponse>(
+    '/admin/grok/sso-to-oauth',
+    payload,
+    { timeout: getGrokSSOImportTimeout(payload.sso_tokens.length) }
+  )
+  return data
+}
+
+export default { generateAuthUrl, exchangeCode, refreshGrokToken, queryQuota, resetQuota, createFromSSO }
