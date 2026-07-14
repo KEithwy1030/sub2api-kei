@@ -4,6 +4,14 @@ on:
   push:
     branches:
       - deploy/vps-responses-lite-fix-20260714
+    paths:
+      - .dockerignore
+      - Dockerfile
+      - backend/**
+      - frontend/**
+      - docs/legal/**
+      - deploy/docker-entrypoint.sh
+      - .github/workflows/vps-image.yml
   workflow_dispatch:
 
 permissions:
