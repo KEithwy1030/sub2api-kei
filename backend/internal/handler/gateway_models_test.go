@@ -22,6 +22,7 @@ type gatewayModelsAccountRepoStub struct {
 type gatewayModelsResponseForTest struct {
 	Object string                    `json:"object"`
 	Data   []gatewayModelItemForTest `json:"data"`
+	Models []json.RawMessage         `json:"models"`
 }
 
 type gatewayModelItemForTest struct {
@@ -533,6 +534,39 @@ func TestGatewayModels_OpenAICustomModelsListKeepsOpenAIResponseShapeForDefaultF
 	require.NotZero(t, got.Data[0].Created)
 	require.Equal(t, "openai", got.Data[0].OwnedBy)
 	require.Empty(t, got.Data[0].CreatedAt)
+	require.Empty(t, got.Models)
+}
+
+func TestGatewayModels_OpenAIResponseIncludesEmptyCodexModelsCatalog(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	groupID := int64(28)
+	h := newGatewayModelsHandlerForTest(
+		&gatewayModelsAccountRepoStub{
+			byGroup: map[int64][]service.Account{
+				groupID: {
+					{ID: 1, Platform: service.PlatformOpenAI},
+				},
+			},
+		},
+	)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{
+		Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI},
+	})
+
+	h.Models(c)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var got gatewayModelsResponseForTest
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.NotEmpty(t, got.Data)
+	require.NotNil(t, got.Models)
+	require.Empty(t, got.Models)
 }
 
 func modelIDsForTest(models []gatewayModelItemForTest) []string {

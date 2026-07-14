@@ -201,6 +201,9 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	if err != nil {
 		return nil, err
 	}
+	if account.Platform != PlatformGrok && isOpenAIResponsesLiteWebSocketPayload(payload) {
+		upstreamReq.Header.Set(responsesLiteHeader, "true")
+	}
 
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
@@ -225,6 +228,14 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(respBody)))
 		if upstreamMsg == "" {
 			upstreamMsg = http.StatusText(resp.StatusCode)
+		}
+		if shouldFailoverOpenAIPassthroughResponse(resp.StatusCode) {
+			s.handleOpenAIAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody, originalModel)
+			return nil, &UpstreamFailoverError{
+				StatusCode:      resp.StatusCode,
+				ResponseBody:    respBody,
+				ResponseHeaders: cloneHeader(resp.Header),
+			}
 		}
 		_ = writeClientMessage(buildOpenAIWSHTTPBridgeErrorEvent(resp.StatusCode, upstreamMsg))
 		return nil, fmt.Errorf("upstream http bridge error: status=%d message=%s", resp.StatusCode, upstreamMsg)

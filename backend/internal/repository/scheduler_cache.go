@@ -562,6 +562,8 @@ func filterSchedulerExtra(extra map[string]any) map[string]any {
 		"auto_pause_5h_disabled",
 		"auto_pause_7d_disabled",
 		"model_rate_limits",
+		"codex_image_generation_bridge",
+		"strip_image_generation_tools",
 	}
 	filtered := make(map[string]any)
 	for _, key := range keys {

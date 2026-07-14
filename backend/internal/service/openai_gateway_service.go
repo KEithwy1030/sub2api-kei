@@ -68,6 +68,7 @@ var openaiAllowedHeaders = map[string]bool{
 	"session_id":            true,
 	"x-codex-turn-state":    true,
 	"x-codex-turn-metadata": true,
+	responsesLiteHeaderKey:  true,
 }
 
 // OpenAI passthrough allowed headers whitelist.
@@ -83,6 +84,7 @@ var openaiPassthroughAllowedHeaders = map[string]bool{
 	"session_id":            true,
 	"x-codex-turn-state":    true,
 	"x-codex-turn-metadata": true,
+	responsesLiteHeaderKey:  true,
 }
 
 // codex_cli_only 拒绝时记录的请求头白名单（仅用于诊断日志，不参与上游透传）

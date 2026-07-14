@@ -286,7 +286,7 @@ func TestAccountTestService_OpenAI429BodyOnlyPersistsRateLimitAndClearsStaleErro
 	require.Empty(t, repo.updatedExtra)
 }
 
-func TestAccountTestService_OpenAI429SyncsObservedPlanType(t *testing.T) {
+func TestAccountTestService_OpenAI429SkipsObservedFreePlanForPaidAccount(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := newTestContext()
 
@@ -306,9 +306,9 @@ func TestAccountTestService_OpenAI429SyncsObservedPlanType(t *testing.T) {
 
 	err := svc.testOpenAIAccountConnection(ctx, account, "gpt-5.4", "", "")
 	require.Error(t, err)
-	require.Equal(t, []int64{account.ID}, repo.bulkUpdatedIDs)
-	require.Equal(t, "free", repo.bulkUpdatedPayload.Credentials["plan_type"])
-	require.Equal(t, "free", account.Credentials["plan_type"])
+	require.Empty(t, repo.bulkUpdatedIDs)
+	require.Empty(t, repo.bulkUpdatedPayload.Credentials)
+	require.Equal(t, "plus", account.Credentials["plan_type"])
 	require.Equal(t, account.ID, repo.rateLimitedID)
 	require.NotNil(t, account.RateLimitResetAt)
 }

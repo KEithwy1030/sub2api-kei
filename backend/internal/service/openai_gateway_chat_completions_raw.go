@@ -152,7 +152,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 	}
 	customUA := account.GetOpenAIUserAgent()
 	if customUA == "" && account.Platform == PlatformGrok {
-		customUA = "sub2api-grok/1.0"
+		customUA = "grok-cli/0.1.250"
 	}
 	resp, err := s.sendCCUpstreamRequest(ctx, c, account, targetURL, upstreamBody, clientStream, token, customUA)
 	if err != nil {

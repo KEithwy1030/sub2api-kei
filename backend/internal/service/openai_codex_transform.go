@@ -811,6 +811,55 @@ func ensureOpenAIResponsesImageGenerationTool(reqBody map[string]any) bool {
 	return true
 }
 
+func ensureOpenAIResponsesWebSearchTool(reqBody map[string]any) bool {
+	if len(reqBody) == 0 {
+		return false
+	}
+
+	tool := map[string]any{"type": "web_search"}
+	rawTools, ok := reqBody["tools"]
+	if !ok || rawTools == nil {
+		reqBody["tools"] = []any{tool}
+		return true
+	}
+
+	tools, ok := rawTools.([]any)
+	if !ok {
+		reqBody["tools"] = []any{tool}
+		return true
+	}
+	for _, rawTool := range tools {
+		toolMap, ok := rawTool.(map[string]any)
+		if ok && strings.TrimSpace(firstNonEmptyString(toolMap["type"])) == "web_search" {
+			return false
+		}
+	}
+
+	reqBody["tools"] = append(tools, tool)
+	return true
+}
+
+func applyCodexWebSearchBridgeInstructions(reqBody map[string]any) bool {
+	if len(reqBody) == 0 {
+		return false
+	}
+
+	const marker = "<sub2api-codex-web-search>"
+	const instructions = marker + "\nWhen the user requests current web information, use the OpenAI Responses native `web_search` tool attached to this request. Do not claim that native web search is unavailable.\n</sub2api-codex-web-search>"
+	existing, _ := reqBody["instructions"].(string)
+	if strings.Contains(existing, marker) {
+		return false
+	}
+
+	existing = strings.TrimRight(existing, " \t\r\n")
+	if existing == "" {
+		reqBody["instructions"] = instructions
+	} else {
+		reqBody["instructions"] = existing + "\n\n" + instructions
+	}
+	return true
+}
+
 func ensureOpenAIResponsesImageGenerationToolChoiceAuto(reqBody map[string]any) bool {
 	if len(reqBody) == 0 || !hasOpenAIImageGenerationTool(reqBody) {
 		return false

@@ -107,3 +107,14 @@ func (a *Account) CodexImageGenerationExplicitToolPolicy() string {
 	}
 	return codexImageGenerationExplicitToolPolicyAllow
 }
+
+// ShouldStripImageGenerationTools reports whether image_generation tools should
+// be stripped from the request body before forwarding to this account's upstream.
+// Used for apikey relay accounts whose upstream org has no image generation permission.
+func (a *Account) ShouldStripImageGenerationTools() bool {
+	if a == nil || a.Extra == nil {
+		return false
+	}
+	v, ok := a.Extra["strip_image_generation_tools"].(bool)
+	return ok && v
+}

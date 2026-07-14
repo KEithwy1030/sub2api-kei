@@ -90,7 +90,7 @@ func TestOpenAIWSHTTPBridgeRelaysSSEFramesAsWebSocketMessages(t *testing.T) {
 		Concurrency: 1,
 		Status:      StatusActive,
 	}
-	payload := []byte(`{"type":"response.create","generate":true,"model":"gpt-5","stream":true,"input":"hi"}`)
+	payload := []byte(`{"type":"response.create","generate":true,"model":"gpt-5","stream":true,"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"},"input":"hi"}`)
 
 	type bridgeResult struct {
 		result *OpenAIForwardResult
@@ -171,9 +171,65 @@ func TestOpenAIWSHTTPBridgeRelaysSSEFramesAsWebSocketMessages(t *testing.T) {
 
 	require.NotNil(t, upstream.lastReq)
 	require.Equal(t, http.MethodPost, upstream.lastReq.Method)
+	require.Equal(t, "true", upstream.lastReq.Header.Get(responsesLiteHeader))
 	require.False(t, gjson.GetBytes(upstream.lastBody, "type").Exists())
 	require.False(t, gjson.GetBytes(upstream.lastBody, "generate").Exists())
 	require.True(t, gjson.GetBytes(upstream.lastBody, "stream").Bool())
+}
+
+func TestOpenAIWSHTTPBridgeReturnsFailoverWithoutWriting429ToClient(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+			"X-Request-Id": []string{"rid_rate_limited"},
+		},
+		Body: io.NopCloser(strings.NewReader(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`)),
+	}}
+	svc := &OpenAIGatewayService{
+		cfg: &config.Config{
+			Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize},
+		},
+		httpUpstream: upstream,
+	}
+	account := &Account{
+		ID:          8,
+		Name:        "oauth-rate-limited",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Concurrency: 1,
+		Status:      StatusActive,
+	}
+	payload := []byte(`{"type":"response.create","generate":true,"model":"gpt-5","stream":true,"input":"hi"}`)
+	writes := 0
+
+	result, err := svc.proxyOpenAIWSHTTPBridgeTurn(
+		context.Background(),
+		nil,
+		account,
+		"access-token",
+		payload,
+		len(payload),
+		"gpt-5",
+		"",
+		"",
+		"",
+		1,
+		func([]byte) error {
+			writes++
+			return nil
+		},
+	)
+
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode)
+	require.Equal(t, "rid_rate_limited", failoverErr.ResponseHeaders.Get("x-request-id"))
+	require.Contains(t, string(failoverErr.ResponseBody), "usage_limit_reached")
+	require.Zero(t, writes, "failover must happen before any error event is sent to the client")
 }
 
 func TestProxyResponsesWebSocketFromClientForGrokUsesXAIHTTPBridge(t *testing.T) {
@@ -282,7 +338,7 @@ func TestProxyResponsesWebSocketFromClientForGrokUsesXAIHTTPBridge(t *testing.T)
 
 	require.Equal(t, xai.DefaultCLIBaseURL+"/responses", upstream.lastReq.URL.String())
 	require.Equal(t, "Bearer access-token", upstream.lastReq.Header.Get("Authorization"))
-	require.Equal(t, "sub2api-grok/1.0", upstream.lastReq.Header.Get("User-Agent"))
+	require.Equal(t, "grok-cli/0.1.250", upstream.lastReq.Header.Get("User-Agent"))
 	require.Equal(t, "grok-4.5", gjson.GetBytes(upstream.lastBody, "model").String())
 	require.False(t, gjson.GetBytes(upstream.lastBody, "type").Exists())
 	require.False(t, gjson.GetBytes(upstream.lastBody, "generate").Exists())

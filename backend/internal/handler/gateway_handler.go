@@ -1022,6 +1022,7 @@ func (h *GatewayHandler) Models(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"object": "list",
 			"data":   openai.DefaultModels,
+			"models": []any{},
 		})
 		return
 	}
@@ -1030,6 +1031,7 @@ func (h *GatewayHandler) Models(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"object": "list",
 			"data":   geminicli.DefaultModels,
+			"models": []any{},
 		})
 		return
 	}
@@ -1037,6 +1039,7 @@ func (h *GatewayHandler) Models(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
 		"data":   claude.DefaultModels,
+		"models": []any{},
 	})
 }
 
@@ -1053,6 +1056,7 @@ func writeModelsList(c *gin.Context, modelIDs []string) {
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
 		"data":   models,
+		"models": []any{},
 	})
 }
 
@@ -1088,6 +1092,7 @@ func writeOpenAIModelsList(c *gin.Context, modelIDs []string) {
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
 		"data":   models,
+		"models": []any{},
 	})
 }
 

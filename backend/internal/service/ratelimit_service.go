@@ -1520,6 +1520,15 @@ func parseOpenAIRateLimitPlanType(body []byte) string {
 	return strings.ToLower(strings.TrimSpace(planType))
 }
 
+func isPaidOpenAIPlanType(planType string) bool {
+	switch strings.ToLower(strings.TrimSpace(planType)) {
+	case "plus", "pro", "team", "business", "enterprise", "edu":
+		return true
+	default:
+		return false
+	}
+}
+
 func persistOpenAI429PlanType(ctx context.Context, repo AccountRepository, account *Account, body []byte) {
 	if repo == nil || account == nil || account.Platform != PlatformOpenAI {
 		return
@@ -1538,6 +1547,10 @@ func persistOpenAI429PlanType(ctx context.Context, repo AccountRepository, accou
 
 	current := strings.TrimSpace(account.GetCredential("plan_type"))
 	if strings.EqualFold(current, planType) {
+		return
+	}
+	if planType == "free" && isPaidOpenAIPlanType(current) {
+		slog.Info("openai_429_plan_type_downgrade_skipped", "account_id", account.ID, "previous_plan_type", current, "observed_plan_type", planType)
 		return
 	}
 

@@ -200,7 +200,7 @@ func TestHandle429_OpenAIPersistsCodexSnapshotImmediately(t *testing.T) {
 	}
 }
 
-func TestHandle429_OpenAISyncsObservedPlanType(t *testing.T) {
+func TestHandle429_OpenAISkipsObservedFreePlanForPaidAccount(t *testing.T) {
 	repo := &openAI429SnapshotRepo{}
 	svc := NewRateLimitService(repo, nil, nil, nil, nil)
 	account := &Account{
@@ -213,9 +213,9 @@ func TestHandle429_OpenAISyncsObservedPlanType(t *testing.T) {
 
 	svc.handle429(context.Background(), account, http.Header{}, body)
 
-	require.Equal(t, []int64{account.ID}, repo.bulkUpdatedIDs)
-	require.Equal(t, "free", repo.bulkUpdatedPayload.Credentials["plan_type"])
-	require.Equal(t, "free", account.Credentials["plan_type"])
+	require.Empty(t, repo.bulkUpdatedIDs)
+	require.Empty(t, repo.bulkUpdatedPayload.Credentials)
+	require.Equal(t, "plus", account.Credentials["plan_type"])
 	require.Equal(t, account.ID, repo.rateLimitedID)
 }
 

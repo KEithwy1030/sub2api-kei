@@ -163,7 +163,12 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	if isCodexCLI {
 		codexImageGenerationExplicitToolPolicy = account.CodexImageGenerationExplicitToolPolicy()
 	}
-	codexImageGenerationBridgeEnabled := isCodexCLI && imageGenerationAllowed && codexImageGenerationExplicitToolPolicy != codexImageGenerationExplicitToolPolicyStrip && s.isCodexImageGenerationBridgeEnabled(ctx, account, apiKey)
+	codexImageGenerationBridgeEnabled := isCodexCLI &&
+		!isOpenAIResponsesLiteHeader(c.GetHeader(responsesLiteHeader)) &&
+		imageGenerationAllowed &&
+		codexImageGenerationExplicitToolPolicy != codexImageGenerationExplicitToolPolicyStrip &&
+		s.isCodexImageGenerationBridgeEnabled(ctx, account, apiKey)
+	codexWebSearchBridgeEnabled := isCodexCLI && s.cfg != nil && s.cfg.Gateway.CodexWebSearchBridgeEnabled
 	var imageIntent bool
 	if isCodexCLI && codexImageGenerationExplicitToolPolicy == codexImageGenerationExplicitToolPolicyStrip {
 		decoded, decodeErr := ensureReqBody()
@@ -275,6 +280,21 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	} else if imageGenerationAllowed && imageIntent && openAIRequestBodyHasImageGenerationTool(body) {
 		// 完整 image_generation tool 只做 raw 计费读取，校验/桥接/旧字段迁移命中时才展开大 input map。
 		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] /responses image_generation request inbound_model=%s mapped_model=%s account_type=%s", requestView.Model, upstreamModel, account.Type)
+	}
+
+	if codexWebSearchBridgeEnabled && !isCompactRequest {
+		decoded, decodeErr := ensureReqBody()
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		if ensureOpenAIResponsesWebSearchTool(decoded) {
+			markDecodedModified()
+			logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Injected /responses web_search tool for Codex client")
+		}
+		if applyCodexWebSearchBridgeInstructions(decoded) {
+			markDecodedModified()
+			logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Added Codex web_search bridge instructions")
+		}
 	}
 
 	if isCodexSparkModel(upstreamModel) && openAIRequestBodyMayContainImageInput(body) {
