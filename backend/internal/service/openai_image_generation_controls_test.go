@@ -153,6 +153,43 @@ func TestOpenAIBuildUpstreamRequestOpenAIPassthroughForwardsResponsesLiteHeader(
 	require.Equal(t, "true", req.Header.Get(responsesLiteHeader))
 }
 
+func TestOpenAIGatewayServiceForward_CodexWebSearchBridgeRespectsResponsesLite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, tt := range []struct {
+		name          string
+		responsesLite bool
+		wantInjected  bool
+	}{
+		{name: "regular responses injects hosted web search", wantInjected: true},
+		{name: "responses lite skips hosted web search", responsesLite: true, wantInjected: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := &httpUpstreamRecorder{
+				resp: &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"id":"resp_web","model":"gpt-5.6-sol","usage":{"input_tokens":1,"output_tokens":1}}`)),
+				},
+			}
+			svc := newOpenAIImageGenerationControlTestService(upstream)
+			svc.cfg.Gateway.CodexWebSearchBridgeEnabled = true
+			c, _ := newOpenAIImageGenerationControlTestContext(true, "codex_cli_rs/0.144.4")
+			if tt.responsesLite {
+				c.Request.Header.Set(responsesLiteHeader, "true")
+			}
+
+			result, err := svc.Forward(context.Background(), c, newOpenAIImageGenerationControlTestAccount(), []byte(`{"model":"gpt-5.6-sol","input":"write code","stream":false}`))
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.NotNil(t, upstream.lastReq)
+			hasWebSearch := gjson.GetBytes(upstream.lastBody, `tools.#(type=="web_search")`).Exists()
+			require.Equal(t, tt.wantInjected, hasWebSearch)
+		})
+	}
+}
+
 func TestOpenAIGatewayServiceForward_ExplicitImageToolWorksWithBridgeDisabled(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
