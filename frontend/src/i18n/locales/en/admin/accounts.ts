@@ -887,7 +887,23 @@ export default {
             GROK_OAUTH_PROXY_NOT_AVAILABLE:
               'Grok OAuth proxy lookup is unavailable. Check the selected proxy and retry.',
             GROK_OAUTH_PROXY_NOT_FOUND:
-              'The selected proxy could not be found. Choose an available proxy and retry.'
+              'The selected proxy could not be found. Choose an available proxy and retry.',
+            GROK_PREFLIGHT_ACCESS_TOKEN_REJECTED:
+              'OAuth refreshed, but the chat endpoint rejected the access token. The account was not imported.',
+            GROK_PREFLIGHT_SPENDING_LIMIT:
+              'The account is blocked by its spending limit and cannot call grok-4.5. It was not imported.',
+            GROK_PREFLIGHT_CHAT_PERMISSION_DENIED:
+              'The OAuth identity exists, but it has no chat endpoint permission. The account was not imported.',
+            GROK_PREFLIGHT_CLI_IDENTITY_REJECTED:
+              'The upstream rejected the Grok CLI identity. The account was not imported.',
+            GROK_PREFLIGHT_RATE_LIMITED:
+              'The preflight was rate limited. Retry later; the account was not imported.',
+            GROK_PREFLIGHT_REQUEST_FAILED:
+              'The Grok chat endpoint could not be reached. Check the network and retry.',
+            GROK_PREFLIGHT_NOT_CONFIGURED:
+              'Grok chat preflight is not configured. The account was not imported.',
+            GROK_PREFLIGHT_UPSTREAM_REJECTED:
+              'The Grok chat endpoint rejected the request (HTTP {status}). The account was not imported.'
           },
           oauthOnlyHint: 'Initial Grok support is OAuth subscription-backed Responses API text and reasoning traffic only.'
         },

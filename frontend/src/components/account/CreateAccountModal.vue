@@ -5125,6 +5125,7 @@ const handleGrokValidateRT = async (refreshTokenInput: string) => {
         if (modelMapping) {
           credentials.model_mapping = modelMapping
         }
+        credentials.model_mapping = { 'grok-4.5': 'grok-4.5' }
         if (!applyTempUnschedConfig(credentials)) {
           return
         }

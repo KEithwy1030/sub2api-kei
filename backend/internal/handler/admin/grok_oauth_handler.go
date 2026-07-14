@@ -1,8 +1,14 @@
 package admin
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
@@ -15,17 +21,20 @@ type GrokOAuthHandler struct {
 	grokOAuthService *service.GrokOAuthService
 	adminService     service.AdminService
 	quotaService     *service.GrokQuotaService
+	httpUpstream     service.HTTPUpstream
 }
 
 func NewGrokOAuthHandler(
 	grokOAuthService *service.GrokOAuthService,
 	adminService service.AdminService,
 	quotaService *service.GrokQuotaService,
+	httpUpstream service.HTTPUpstream,
 ) *GrokOAuthHandler {
 	return &GrokOAuthHandler{
 		grokOAuthService: grokOAuthService,
 		adminService:     adminService,
 		quotaService:     quotaService,
+		httpUpstream:     httpUpstream,
 	}
 }
 
@@ -80,7 +89,25 @@ type GrokRefreshTokenRequest struct {
 	RT           string `json:"rt"`
 	ClientID     string `json:"client_id"`
 	ProxyID      *int64 `json:"proxy_id"`
+	ProbeModel   string `json:"probe_model"`
 }
+
+type GrokChatPreflightResult struct {
+	Usable     bool   `json:"usable"`
+	Model      string `json:"model"`
+	StatusCode int    `json:"status_code,omitempty"`
+	Reason     string `json:"reason"`
+}
+
+type GrokRefreshTokenResult struct {
+	TokenInfo *service.GrokTokenInfo  `json:"token_info"`
+	Preflight GrokChatPreflightResult `json:"preflight"`
+}
+
+const (
+	grokPreflightModel   = "grok-4.5"
+	grokPreflightTimeout = 30 * time.Second
+)
 
 func (h *GrokOAuthHandler) RefreshToken(c *gin.Context) {
 	var req GrokRefreshTokenRequest
@@ -109,7 +136,70 @@ func (h *GrokOAuthHandler) RefreshToken(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
-	response.Success(c, tokenInfo)
+	preflight := h.probeGrokChat(c.Request.Context(), tokenInfo.AccessToken, proxyURL, req.ProbeModel)
+	response.Success(c, &GrokRefreshTokenResult{TokenInfo: tokenInfo, Preflight: preflight})
+}
+
+func (h *GrokOAuthHandler) probeGrokChat(ctx context.Context, accessToken, proxyURL, model string) GrokChatPreflightResult {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = grokPreflightModel
+	}
+	result := GrokChatPreflightResult{Model: model, Reason: "GROK_PREFLIGHT_NOT_CONFIGURED"}
+	if h == nil || h.httpUpstream == nil {
+		return result
+	}
+	body, err := json.Marshal(map[string]any{
+		"model": model, "input": ".", "max_output_tokens": 1, "store": false, "stream": false,
+	})
+	if err != nil {
+		result.Reason = "GROK_PREFLIGHT_REQUEST_BUILD_FAILED"
+		return result
+	}
+	targetURL, err := xai.BuildResponsesURL(xai.DefaultCLIBaseURL)
+	if err != nil {
+		result.Reason = "GROK_PREFLIGHT_REQUEST_BUILD_FAILED"
+		return result
+	}
+	callCtx, cancel := context.WithTimeout(ctx, grokPreflightTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		result.Reason = "GROK_PREFLIGHT_REQUEST_BUILD_FAILED"
+		return result
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := h.httpUpstream.Do(req, proxyURL, 0, 1)
+	if err != nil {
+		result.Reason = "GROK_PREFLIGHT_REQUEST_FAILED"
+		return result
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	result.StatusCode = resp.StatusCode
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		result.Usable = true
+		result.Reason = "GROK_PREFLIGHT_OK"
+		return result
+	}
+	switch resp.StatusCode {
+	case http.StatusUnauthorized:
+		result.Reason = "GROK_PREFLIGHT_ACCESS_TOKEN_REJECTED"
+	case http.StatusPaymentRequired:
+		result.Reason = "GROK_PREFLIGHT_SPENDING_LIMIT"
+	case http.StatusForbidden:
+		result.Reason = "GROK_PREFLIGHT_CHAT_PERMISSION_DENIED"
+	case http.StatusUpgradeRequired:
+		result.Reason = "GROK_PREFLIGHT_CLI_IDENTITY_REJECTED"
+	case http.StatusTooManyRequests:
+		result.Reason = "GROK_PREFLIGHT_RATE_LIMITED"
+	default:
+		result.Reason = "GROK_PREFLIGHT_UPSTREAM_REJECTED"
+	}
+	return result
 }
 
 func (h *GrokOAuthHandler) RefreshAccountToken(c *gin.Context) {

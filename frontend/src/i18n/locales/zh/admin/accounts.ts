@@ -974,7 +974,19 @@ export default {
             GROK_OAUTH_PROXY_NOT_AVAILABLE:
               '无法查询 Grok OAuth 代理配置。请检查选择的代理后重试。',
             GROK_OAUTH_PROXY_NOT_FOUND:
-              '找不到所选代理。请选择可用代理后重试。'
+              '找不到所选代理。请选择可用代理后重试。',
+            GROK_PREFLIGHT_ACCESS_TOKEN_REJECTED:
+              'OAuth 已刷新，但 access token 被聊天端点拒绝，账号不会导入。',
+            GROK_PREFLIGHT_SPENDING_LIMIT: '账号受消费额度限制，无法调用 grok-4.5，账号不会导入。',
+            GROK_PREFLIGHT_CHAT_PERMISSION_DENIED:
+              'OAuth 身份存在，但账号没有聊天端点权限，账号不会导入。',
+            GROK_PREFLIGHT_CLI_IDENTITY_REJECTED:
+              'Grok CLI 客户端身份被上游拒绝，账号不会导入。',
+            GROK_PREFLIGHT_RATE_LIMITED: '账号预检触发限流，请稍后重试；本次不会导入。',
+            GROK_PREFLIGHT_REQUEST_FAILED: '无法连接 Grok 聊天端点，请检查网络后重试。',
+            GROK_PREFLIGHT_NOT_CONFIGURED: '服务器未配置 Grok 聊天预检，账号不会导入。',
+            GROK_PREFLIGHT_UPSTREAM_REJECTED:
+              'Grok 聊天端点拒绝请求（HTTP {status}），账号不会导入。'
           },
           oauthOnlyHint: '首版 Grok 支持仅包含 OAuth 订阅的 Responses API 文本/推理转发。'
         },

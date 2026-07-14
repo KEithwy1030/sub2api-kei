@@ -39,6 +39,18 @@ export interface GrokTokenInfo {
   [key: string]: unknown
 }
 
+export interface GrokChatPreflightResult {
+  usable: boolean
+  model: string
+  status_code?: number
+  reason: string
+}
+
+export interface GrokRefreshTokenResult {
+  token_info: GrokTokenInfo
+  preflight: GrokChatPreflightResult
+}
+
 export interface GrokQuotaWindow {
   limit?: number | null
   remaining?: number | null
@@ -98,11 +110,11 @@ export async function exchangeCode(payload: GrokExchangeCodeRequest): Promise<Gr
 export async function refreshGrokToken(
   refreshToken: string,
   proxyId?: number | null
-): Promise<GrokTokenInfo> {
-  const payload: Record<string, unknown> = { refresh_token: refreshToken }
+): Promise<GrokRefreshTokenResult> {
+  const payload: Record<string, unknown> = { refresh_token: refreshToken, probe_model: 'grok-4.5' }
   if (proxyId) payload.proxy_id = proxyId
 
-  const { data } = await apiClient.post<GrokTokenInfo>(
+  const { data } = await apiClient.post<GrokRefreshTokenResult>(
     '/admin/grok/oauth/refresh-token',
     payload
   )

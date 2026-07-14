@@ -53,3 +53,37 @@ describe('useGrokOAuth.exchangeAuthCode', () => {
     )
   })
 })
+
+describe('useGrokOAuth.validateRefreshToken', () => {
+  it('returns credentials only after a successful chat preflight', async () => {
+    vi.mocked(adminAPI.grok.refreshGrokToken).mockResolvedValueOnce({
+      token_info: { access_token: 'access-token', refresh_token: 'refresh-token' },
+      preflight: { usable: true, model: 'grok-4.5', status_code: 200, reason: 'GROK_PREFLIGHT_OK' }
+    })
+    const oauth = useGrokOAuth()
+
+    const tokenInfo = await oauth.validateRefreshToken('refresh-token')
+
+    expect(tokenInfo?.access_token).toBe('access-token')
+    expect(oauth.buildCredentials(tokenInfo!)).toMatchObject({
+      base_url: 'https://cli-chat-proxy.grok.com/v1',
+      model_mapping: { 'grok-4.5': 'grok-4.5' }
+    })
+  })
+
+  it('rejects an OAuth identity without chat permission', async () => {
+    vi.mocked(adminAPI.grok.refreshGrokToken).mockResolvedValueOnce({
+      token_info: { access_token: 'access-token' },
+      preflight: {
+        usable: false,
+        model: 'grok-4.5',
+        status_code: 403,
+        reason: 'GROK_PREFLIGHT_CHAT_PERMISSION_DENIED'
+      }
+    })
+    const oauth = useGrokOAuth()
+
+    expect(await oauth.validateRefreshToken('refresh-token')).toBeNull()
+    expect(oauth.error.value).toContain('GROK_PREFLIGHT_CHAT_PERMISSION_DENIED')
+  })
+})

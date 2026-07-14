@@ -99,7 +99,14 @@ export function useGrokOAuth() {
     error.value = ''
 
     try {
-      return await adminAPI.grok.refreshGrokToken(refreshToken.trim(), proxyId)
+      const result = await adminAPI.grok.refreshGrokToken(refreshToken.trim(), proxyId)
+      if (!result.preflight.usable) {
+        error.value = t(`admin.accounts.oauth.grok.errors.${result.preflight.reason}`, {
+          status: result.preflight.status_code ?? '-'
+        })
+        return null
+      }
+      return result.token_info
     } catch (err: any) {
       error.value = extractI18nErrorMessage(
         err,
@@ -126,6 +133,8 @@ export function useGrokOAuth() {
     }
     if (tokenInfo.refresh_token) credentials.refresh_token = tokenInfo.refresh_token
     if (tokenInfo.id_token) credentials.id_token = tokenInfo.id_token
+    credentials.base_url = 'https://cli-chat-proxy.grok.com/v1'
+    credentials.model_mapping = { 'grok-4.5': 'grok-4.5' }
     return Object.fromEntries(Object.entries(credentials).filter(([, value]) => value !== undefined && value !== ''))
   }
 

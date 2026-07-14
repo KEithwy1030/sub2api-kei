@@ -86,7 +86,7 @@ func TestGrokOAuthHandlerQueryQuotaProbesUpstream(t *testing.T) {
 		Body: io.NopCloser(strings.NewReader(`{"id":"resp_probe"}`)),
 	}}
 	quotaService := service.NewGrokQuotaService(repo, nil, service.NewGrokTokenProvider(repo, nil), upstream)
-	handler := NewGrokOAuthHandler(nil, nil, quotaService)
+	handler := NewGrokOAuthHandler(nil, nil, quotaService, nil)
 
 	router := gin.New()
 	router.GET("/api/v1/admin/grok/accounts/:id/quota", handler.QueryQuota)
@@ -113,7 +113,7 @@ func TestGrokOAuthHandlerResetQuotaReturnsUnsupported(t *testing.T) {
 		Type:     service.AccountTypeOAuth,
 	}}
 	quotaService := service.NewGrokQuotaService(repo, nil, nil, nil)
-	handler := NewGrokOAuthHandler(nil, nil, quotaService)
+	handler := NewGrokOAuthHandler(nil, nil, quotaService, nil)
 
 	router := gin.New()
 	router.POST("/api/v1/admin/grok/accounts/:id/reset-quota", handler.ResetQuota)
@@ -131,7 +131,7 @@ func TestGrokOAuthHandlerRuntimeSanityDoesNotExposeSecrets(t *testing.T) {
 	t.Setenv(xai.EnvBaseURL, "http://127.0.0.1:8080/v1?access_token=secret")
 	t.Setenv(xai.EnvClientID, "client-secret-like-value")
 
-	handler := NewGrokOAuthHandler(nil, nil, nil)
+	handler := NewGrokOAuthHandler(nil, nil, nil, nil)
 	router := gin.New()
 	router.GET("/api/v1/admin/grok/runtime-sanity", handler.RuntimeSanity)
 	rec := httptest.NewRecorder()
@@ -144,4 +144,35 @@ func TestGrokOAuthHandlerRuntimeSanityDoesNotExposeSecrets(t *testing.T) {
 	require.NotContains(t, rec.Body.String(), "access_token")
 	require.NotContains(t, rec.Body.String(), "secret")
 	require.NotContains(t, rec.Body.String(), "client-secret-like-value")
+}
+
+func TestGrokChatPreflightAcceptsWorkingAccount(t *testing.T) {
+	upstream := &grokQuotaHandlerUpstream{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`{"id":"resp_ok"}`)),
+	}}
+	handler := NewGrokOAuthHandler(nil, nil, nil, upstream)
+
+	result := handler.probeGrokChat(context.Background(), "access-token", "", "")
+
+	require.True(t, result.Usable)
+	require.Equal(t, "GROK_PREFLIGHT_OK", result.Reason)
+	require.Equal(t, "grok-4.5", result.Model)
+	require.Equal(t, xai.DefaultCLIBaseURL+"/responses", upstream.lastReq.URL.String())
+	require.Equal(t, "Bearer access-token", upstream.lastReq.Header.Get("Authorization"))
+	require.Contains(t, string(upstream.lastBody), `"model":"grok-4.5"`)
+}
+
+func TestGrokChatPreflightRejectsMissingChatPermission(t *testing.T) {
+	upstream := &grokQuotaHandlerUpstream{resp: &http.Response{
+		StatusCode: http.StatusForbidden,
+		Body:       io.NopCloser(strings.NewReader(`{"error":"permission-denied"}`)),
+	}}
+	handler := NewGrokOAuthHandler(nil, nil, nil, upstream)
+
+	result := handler.probeGrokChat(context.Background(), "access-token", "", "grok-4.5")
+
+	require.False(t, result.Usable)
+	require.Equal(t, http.StatusForbidden, result.StatusCode)
+	require.Equal(t, "GROK_PREFLIGHT_CHAT_PERMISSION_DENIED", result.Reason)
 }
