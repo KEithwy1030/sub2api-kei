@@ -17,7 +17,7 @@ import (
 const (
 	grokQuotaUpstreamTimeout = 20 * time.Second
 	grokQuotaProbeInput      = "."
-	grokQuotaDefaultModel    = "grok-4.3"
+	grokQuotaDefaultModel    = "grok-4.5"
 )
 
 type GrokQuotaProbeResult struct {
