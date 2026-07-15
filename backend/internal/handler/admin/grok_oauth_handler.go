@@ -21,11 +21,15 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const grokSSOImportConcurrency = 3
+const (
+	grokSSOImportConcurrency = 3
+	grokSSOImportAttempts    = 3
+)
 
 type GrokOAuthHandler struct {
 	grokOAuthService *service.GrokOAuthService
 	adminService     service.AdminService
+	accountRepo      service.AccountRepository
 	quotaService     *service.GrokQuotaService
 	httpUpstream     service.HTTPUpstream
 }
@@ -33,12 +37,14 @@ type GrokOAuthHandler struct {
 func NewGrokOAuthHandler(
 	grokOAuthService *service.GrokOAuthService,
 	adminService service.AdminService,
+	accountRepo service.AccountRepository,
 	quotaService *service.GrokQuotaService,
 	httpUpstream service.HTTPUpstream,
 ) *GrokOAuthHandler {
 	return &GrokOAuthHandler{
 		grokOAuthService: grokOAuthService,
 		adminService:     adminService,
+		accountRepo:      accountRepo,
 		quotaService:     quotaService,
 		httpUpstream:     httpUpstream,
 	}
@@ -99,10 +105,11 @@ type GrokRefreshTokenRequest struct {
 }
 
 type GrokChatPreflightResult struct {
-	Usable     bool   `json:"usable"`
-	Model      string `json:"model"`
-	StatusCode int    `json:"status_code,omitempty"`
-	Reason     string `json:"reason"`
+	Usable            bool   `json:"usable"`
+	Model             string `json:"model"`
+	StatusCode        int    `json:"status_code,omitempty"`
+	Reason            string `json:"reason"`
+	RetryAfterSeconds int64  `json:"retry_after_seconds,omitempty"`
 }
 
 type GrokRefreshTokenResult struct {
@@ -186,6 +193,12 @@ func (h *GrokOAuthHandler) probeGrokChat(ctx context.Context, accessToken, proxy
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	result.StatusCode = resp.StatusCode
+	if resp.StatusCode == http.StatusTooManyRequests {
+		result.RetryAfterSeconds = int64((2 * time.Minute).Seconds())
+		if snapshot := xai.ParseQuotaHeaders(resp.Header, resp.StatusCode); snapshot != nil && snapshot.RetryAfterSeconds != nil && *snapshot.RetryAfterSeconds > 0 {
+			result.RetryAfterSeconds = int64(*snapshot.RetryAfterSeconds)
+		}
+	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		result.Usable = true
 		result.Reason = "GROK_PREFLIGHT_OK"
@@ -407,7 +420,7 @@ func (h *GrokOAuthHandler) safeCreateAccountFromSSOToken(ctx context.Context, re
 }
 
 func (h *GrokOAuthHandler) createAccountFromSSOToken(ctx context.Context, req GrokSSOToOAuthRequest, token string, index, total int) grokSSOImportWorkerResult {
-	tokenInfo, err := h.grokOAuthService.ConvertFromSSO(ctx, token, req.ProxyID)
+	tokenInfo, err := h.convertGrokSSOWithRetry(ctx, token, req.ProxyID, index)
 	if err != nil {
 		return grokSSOImportWorkerResult{item: GrokSSOToOAuthItemResult{Index: index, Error: grokSSOImportErrorMessage(err)}}
 	}
@@ -418,14 +431,6 @@ func (h *GrokOAuthHandler) createAccountFromSSOToken(ctx context.Context, req Gr
 		}
 	}
 	preflight := h.probeGrokChat(ctx, tokenInfo.AccessToken, proxyURL, grokPreflightModel)
-	if !preflight.Usable {
-		return grokSSOImportWorkerResult{item: GrokSSOToOAuthItemResult{
-			Index:     index,
-			Email:     tokenInfo.Email,
-			Preflight: &preflight,
-			Error:     preflight.Reason,
-		}}
-	}
 
 	credentials := h.grokOAuthService.BuildAccountCredentials(tokenInfo)
 	credentials = service.MergeCredentials(cloneGrokSSOMap(req.Credentials), credentials)
@@ -452,15 +457,87 @@ func (h *GrokOAuthHandler) createAccountFromSSOToken(ctx context.Context, req Gr
 	if err != nil {
 		return grokSSOImportWorkerResult{item: GrokSSOToOAuthItemResult{Index: index, Name: name, Email: tokenInfo.Email, Error: grokSSOImportErrorMessage(err)}}
 	}
+	if err := h.applyGrokImportPreflightState(ctx, account, preflight); err != nil {
+		_ = h.adminService.SetAccountError(ctx, account.ID, "failed to persist Grok preflight state: "+err.Error())
+		return grokSSOImportWorkerResult{created: true, item: GrokSSOToOAuthItemResult{
+			Index: index, Name: name, Email: tokenInfo.Email, Account: dto.AccountFromService(account), Preflight: &preflight,
+			Error: "GROK_PREFLIGHT_STATE_PERSIST_FAILED",
+		}}
+	}
 	return grokSSOImportWorkerResult{
 		created: true,
 		item: GrokSSOToOAuthItemResult{
-			Index:   index,
-			Name:    name,
-			Email:   tokenInfo.Email,
-			Account: dto.AccountFromService(account),
+			Index: index, Name: name, Email: tokenInfo.Email, Account: dto.AccountFromService(account), Preflight: &preflight,
 		},
 	}
+}
+
+func (h *GrokOAuthHandler) convertGrokSSOWithRetry(ctx context.Context, token string, proxyID *int64, index int) (*service.GrokTokenInfo, error) {
+	var lastErr error
+	for attempt := 0; attempt < grokSSOImportAttempts; attempt++ {
+		tokenInfo, err := h.grokOAuthService.ConvertFromSSO(ctx, token, proxyID)
+		if err == nil {
+			return tokenInfo, nil
+		}
+		lastErr = err
+		if !grokSSOImportRetryable(err) || attempt == grokSSOImportAttempts-1 {
+			break
+		}
+		backoff := time.Duration(2<<attempt)*time.Second + time.Duration(index%3)*500*time.Millisecond
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, lastErr
+}
+
+func grokSSOImportRetryable(err error) bool {
+	status := infraerrors.FromError(err)
+	if status == nil {
+		return false
+	}
+	switch status.Reason {
+	case "GROK_SSO_UPSTREAM_FAILED", "GROK_SSO_CONVERSION_FAILED", "GROK_SSO_TIMEOUT":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *GrokOAuthHandler) applyGrokImportPreflightState(ctx context.Context, account *service.Account, preflight GrokChatPreflightResult) error {
+	if account == nil || preflight.Usable {
+		return nil
+	}
+	if h.accountRepo == nil {
+		return fmt.Errorf("account repository is unavailable")
+	}
+
+	cooldown := time.Duration(0)
+	switch preflight.StatusCode {
+	case 0:
+		cooldown = 2 * time.Minute
+	case http.StatusUnauthorized:
+		cooldown = 10 * time.Minute
+	case http.StatusForbidden:
+		cooldown = 30 * time.Minute
+	case http.StatusTooManyRequests:
+		cooldown = time.Duration(preflight.RetryAfterSeconds) * time.Second
+		if cooldown <= 0 {
+			cooldown = 2 * time.Minute
+		}
+	default:
+		if preflight.StatusCode >= 500 {
+			cooldown = 2 * time.Minute
+		}
+	}
+	if cooldown > 0 {
+		return h.accountRepo.SetTempUnschedulable(ctx, account.ID, time.Now().Add(cooldown), preflight.Reason)
+	}
+	return h.accountRepo.SetError(ctx, account.ID, preflight.Reason)
 }
 
 func grokSSOImportExpiry(requestExpiresAt *int64, requestAutoPause *bool, tokenInfo *service.GrokTokenInfo) (*int64, *bool) {

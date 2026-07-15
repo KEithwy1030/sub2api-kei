@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -21,8 +22,13 @@ import (
 
 type grokQuotaHandlerAccountRepo struct {
 	service.AccountRepository
-	account *service.Account
-	updates map[int64]map[string]any
+	account                 *service.Account
+	updates                 map[int64]map[string]any
+	tempUnschedulableID     int64
+	tempUnschedulableUntil  time.Time
+	tempUnschedulableReason string
+	errorID                 int64
+	errorMessage            string
 }
 
 func (r *grokQuotaHandlerAccountRepo) GetByID(_ context.Context, id int64) (*service.Account, error) {
@@ -37,6 +43,19 @@ func (r *grokQuotaHandlerAccountRepo) UpdateExtra(_ context.Context, id int64, u
 		r.updates = make(map[int64]map[string]any)
 	}
 	r.updates[id] = updates
+	return nil
+}
+
+func (r *grokQuotaHandlerAccountRepo) SetTempUnschedulable(_ context.Context, id int64, until time.Time, reason string) error {
+	r.tempUnschedulableID = id
+	r.tempUnschedulableUntil = until
+	r.tempUnschedulableReason = reason
+	return nil
+}
+
+func (r *grokQuotaHandlerAccountRepo) SetError(_ context.Context, id int64, message string) error {
+	r.errorID = id
+	r.errorMessage = message
 	return nil
 }
 
@@ -105,7 +124,7 @@ func TestGrokOAuthHandlerQueryQuotaProbesUpstream(t *testing.T) {
 		Body: io.NopCloser(strings.NewReader(`{"id":"resp_probe"}`)),
 	}}
 	quotaService := service.NewGrokQuotaService(repo, nil, service.NewGrokTokenProvider(repo, nil), upstream)
-	handler := NewGrokOAuthHandler(nil, nil, quotaService, nil)
+	handler := NewGrokOAuthHandler(nil, nil, repo, quotaService, nil)
 
 	router := gin.New()
 	router.GET("/api/v1/admin/grok/accounts/:id/quota", handler.QueryQuota)
@@ -132,7 +151,7 @@ func TestGrokOAuthHandlerResetQuotaReturnsUnsupported(t *testing.T) {
 		Type:     service.AccountTypeOAuth,
 	}}
 	quotaService := service.NewGrokQuotaService(repo, nil, nil, nil)
-	handler := NewGrokOAuthHandler(nil, nil, quotaService, nil)
+	handler := NewGrokOAuthHandler(nil, nil, repo, quotaService, nil)
 
 	router := gin.New()
 	router.POST("/api/v1/admin/grok/accounts/:id/reset-quota", handler.ResetQuota)
@@ -150,7 +169,7 @@ func TestGrokOAuthHandlerRuntimeSanityDoesNotExposeSecrets(t *testing.T) {
 	t.Setenv(xai.EnvBaseURL, "http://127.0.0.1:8080/v1?access_token=secret")
 	t.Setenv(xai.EnvClientID, "client-secret-like-value")
 
-	handler := NewGrokOAuthHandler(nil, nil, nil, nil)
+	handler := NewGrokOAuthHandler(nil, nil, nil, nil, nil)
 	router := gin.New()
 	router.GET("/api/v1/admin/grok/runtime-sanity", handler.RuntimeSanity)
 	rec := httptest.NewRecorder()
@@ -170,7 +189,7 @@ func TestGrokChatPreflightAcceptsWorkingAccount(t *testing.T) {
 		StatusCode: http.StatusOK,
 		Body:       io.NopCloser(strings.NewReader(`{"id":"resp_ok"}`)),
 	}}
-	handler := NewGrokOAuthHandler(nil, nil, nil, upstream)
+	handler := NewGrokOAuthHandler(nil, nil, nil, nil, upstream)
 
 	result := handler.probeGrokChat(context.Background(), "access-token", "", "")
 
@@ -187,7 +206,7 @@ func TestGrokChatPreflightRejectsMissingChatPermission(t *testing.T) {
 		StatusCode: http.StatusForbidden,
 		Body:       io.NopCloser(strings.NewReader(`{"error":"permission-denied"}`)),
 	}}
-	handler := NewGrokOAuthHandler(nil, nil, nil, upstream)
+	handler := NewGrokOAuthHandler(nil, nil, nil, nil, upstream)
 
 	result := handler.probeGrokChat(context.Background(), "access-token", "", "grok-4.5")
 
@@ -196,21 +215,74 @@ func TestGrokChatPreflightRejectsMissingChatPermission(t *testing.T) {
 	require.Equal(t, "GROK_PREFLIGHT_CHAT_PERMISSION_DENIED", result.Reason)
 }
 
-func TestGrokSSOImportDoesNotCreateAccountWhenChatPreflightFails(t *testing.T) {
+func TestGrokSSOImportCreatesCoolingAccountWhenChatPreflightFails(t *testing.T) {
 	oauthService := service.NewGrokOAuthService(nil, grokSSOHandlerOAuthClient{})
 	defer oauthService.Stop()
+	adminService := newStubAdminService()
+	repo := &grokQuotaHandlerAccountRepo{}
 	upstream := &grokQuotaHandlerUpstream{resp: &http.Response{
 		StatusCode: http.StatusForbidden,
 		Body:       io.NopCloser(strings.NewReader(`{"error":"permission-denied"}`)),
 	}}
-	handler := NewGrokOAuthHandler(oauthService, nil, nil, upstream)
+	handler := NewGrokOAuthHandler(oauthService, adminService, repo, nil, upstream)
 
 	result := handler.createAccountFromSSOToken(context.Background(), GrokSSOToOAuthRequest{}, "sso-token", 1, 1)
 
-	require.False(t, result.created)
-	require.Nil(t, result.item.Account)
+	require.True(t, result.created)
+	require.NotNil(t, result.item.Account)
 	require.NotNil(t, result.item.Preflight)
-	require.Equal(t, "GROK_PREFLIGHT_CHAT_PERMISSION_DENIED", result.item.Error)
+	require.Empty(t, result.item.Error)
+	require.Len(t, adminService.createdAccounts, 1)
+	require.Equal(t, int64(300), repo.tempUnschedulableID)
+	require.Equal(t, "GROK_PREFLIGHT_CHAT_PERMISSION_DENIED", repo.tempUnschedulableReason)
+	require.WithinDuration(t, time.Now().Add(30*time.Minute), repo.tempUnschedulableUntil, 2*time.Second)
+}
+
+func TestGrokSSOImportUsesRetryAfterForRateLimitedAccount(t *testing.T) {
+	oauthService := service.NewGrokOAuthService(nil, grokSSOHandlerOAuthClient{})
+	defer oauthService.Stop()
+	adminService := newStubAdminService()
+	repo := &grokQuotaHandlerAccountRepo{}
+	retryAfter := int64(420)
+	upstream := &grokQuotaHandlerUpstream{resp: &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": []string{"420"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":"rate-limited"}`)),
+	}}
+	handler := NewGrokOAuthHandler(oauthService, adminService, repo, nil, upstream)
+
+	result := handler.createAccountFromSSOToken(context.Background(), GrokSSOToOAuthRequest{}, "sso-token", 1, 1)
+
+	require.True(t, result.created)
+	require.Equal(t, retryAfter, result.item.Preflight.RetryAfterSeconds)
+	require.WithinDuration(t, time.Now().Add(time.Duration(retryAfter)*time.Second), repo.tempUnschedulableUntil, 2*time.Second)
+	require.Equal(t, "GROK_PREFLIGHT_RATE_LIMITED", repo.tempUnschedulableReason)
+}
+
+func TestGrokSSOImportMarksNonRecoverablePreflightAsError(t *testing.T) {
+	oauthService := service.NewGrokOAuthService(nil, grokSSOHandlerOAuthClient{})
+	defer oauthService.Stop()
+	adminService := newStubAdminService()
+	repo := &grokQuotaHandlerAccountRepo{}
+	upstream := &grokQuotaHandlerUpstream{resp: &http.Response{
+		StatusCode: http.StatusPaymentRequired,
+		Body:       io.NopCloser(strings.NewReader(`{"error":"spending-limit"}`)),
+	}}
+	handler := NewGrokOAuthHandler(oauthService, adminService, repo, nil, upstream)
+
+	result := handler.createAccountFromSSOToken(context.Background(), GrokSSOToOAuthRequest{}, "sso-token", 1, 1)
+
+	require.True(t, result.created)
+	require.Equal(t, int64(300), repo.errorID)
+	require.Equal(t, "GROK_PREFLIGHT_SPENDING_LIMIT", repo.errorMessage)
+	require.Zero(t, repo.tempUnschedulableID)
+}
+
+func TestGrokSSOImportRetryClassification(t *testing.T) {
+	require.True(t, grokSSOImportRetryable(infraerrors.New(http.StatusBadGateway, "GROK_SSO_UPSTREAM_FAILED", "temporary upstream failure")))
+	require.True(t, grokSSOImportRetryable(infraerrors.New(http.StatusGatewayTimeout, "GROK_SSO_TIMEOUT", "temporary timeout")))
+	require.False(t, grokSSOImportRetryable(infraerrors.New(http.StatusUnauthorized, "GROK_SSO_UNAUTHORIZED", "expired")))
+	require.False(t, grokSSOImportRetryable(infraerrors.New(http.StatusForbidden, "GROK_SSO_AUTHORIZATION_DENIED", "denied")))
 }
 
 func TestGrokSSOImportExpiryUsesTokenExpiryWithoutRefreshToken(t *testing.T) {
