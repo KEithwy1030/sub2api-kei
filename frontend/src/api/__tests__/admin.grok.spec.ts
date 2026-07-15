@@ -21,18 +21,38 @@ describe('admin Grok SSO import API', () => {
     [3, 215_000],
     [4, 340_000],
     [7, 465_000],
-  ])('uses a timeout sized for %i keys', async (keyCount, expectedTimeout) => {
+  ])('calculates a timeout sized for %i keys', (keyCount, expectedTimeout) => {
     expect(getGrokSSOImportTimeout(keyCount)).toBe(expectedTimeout)
+  })
 
-    await createFromSSO({
-      sso_tokens: Array.from({ length: keyCount }, (_, index) => `sso-${index + 1}`),
+  it('splits large imports into bounded chunks and preserves global indexes', async () => {
+    post
+      .mockResolvedValueOnce({
+        data: { created: [{ index: 1 }, { index: 6 }], failed: [] },
+      })
+      .mockResolvedValueOnce({
+        data: { created: [{ index: 1 }], failed: [{ index: 2, error: 'denied' }] },
+      })
+
+    const result = await createFromSSO({
+      sso_tokens: Array.from({ length: 8 }, (_, index) => `sso-${index + 1}`),
     })
 
-    expect(post).toHaveBeenCalledWith(
+    expect(post).toHaveBeenCalledTimes(2)
+    expect(post).toHaveBeenNthCalledWith(
+      1,
       '/admin/grok/sso-to-oauth',
-      expect.objectContaining({ sso_tokens: expect.any(Array) }),
-      { timeout: expectedTimeout },
+      expect.objectContaining({ sso_tokens: ['sso-1', 'sso-2', 'sso-3', 'sso-4', 'sso-5', 'sso-6'] }),
+      { timeout: getGrokSSOImportTimeout(6) },
     )
+    expect(post).toHaveBeenNthCalledWith(
+      2,
+      '/admin/grok/sso-to-oauth',
+      expect.objectContaining({ sso_tokens: ['sso-7', 'sso-8'] }),
+      { timeout: getGrokSSOImportTimeout(2) },
+    )
+    expect(result.created.map((item) => item.index)).toEqual([1, 6, 7])
+    expect(result.failed.map((item) => item.index)).toEqual([8])
   })
 
   it('extracts only the SSO token from grok-register account lines', () => {
@@ -41,5 +61,19 @@ describe('admin Grok SSO import API', () => {
       token,
       token,
     ])
+  })
+
+  it('keeps completed chunk results when a later chunk fails', async () => {
+    post
+      .mockResolvedValueOnce({ data: { created: [{ index: 1 }], failed: [] } })
+      .mockRejectedValueOnce(new Error('network timeout'))
+
+    const result = await createFromSSO({
+      sso_tokens: Array.from({ length: 8 }, (_, index) => `sso-${index + 1}`),
+    })
+
+    expect(result.created.map((item) => item.index)).toEqual([1])
+    expect(result.failed.map((item) => item.index)).toEqual([7, 8])
+    expect(result.failed.every((item) => item.error === 'network timeout')).toBe(true)
   })
 })

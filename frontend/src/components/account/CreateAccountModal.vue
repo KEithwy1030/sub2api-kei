@@ -5281,7 +5281,9 @@ const handleGrokImportSSO = async (ssoInput: string) => {
 
     const successCount = result.created?.length || 0
     const failedCount = result.failed?.length || 0
-    if (successCount > 0 && failedCount === 0) {
+    const activeCount = (result.created || []).filter((item) => item.preflight?.usable).length
+    const coolingCount = successCount - activeCount
+    if (successCount > 0 && failedCount === 0 && coolingCount === 0) {
       appStore.showSuccess(
         ssoTokens.length > 1
           ? t('admin.accounts.oauth.batchSuccess', { count: successCount })
@@ -5289,15 +5291,17 @@ const handleGrokImportSSO = async (ssoInput: string) => {
       )
       emit('created')
       handleClose()
-    } else if (successCount > 0 && failedCount > 0) {
-      // Same as OpenAI/Grok RT: keep input, show failures, refresh list.
+    } else if (successCount > 0) {
       appStore.showWarning(
-        t('admin.accounts.oauth.batchPartialSuccess', { success: successCount, failed: failedCount })
+        t('admin.accounts.oauth.grok.ssoBatchResult', { active: activeCount, cooling: coolingCount, failed: failedCount })
       )
-      grokOAuth.error.value = (result.failed || [])
-        .map((item) => `#${item.index}: ${item.error || 'Unknown error'}`)
-        .join('\n')
+      if (failedCount > 0) {
+        grokOAuth.error.value = (result.failed || [])
+          .map((item) => `#${item.index}: ${item.error || 'Unknown error'}`)
+          .join('\n')
+      }
       emit('created')
+      if (failedCount === 0) handleClose()
     } else {
       grokOAuth.error.value = (result.failed || [])
         .map((item) => `#${item.index}: ${item.error || 'Unknown error'}`)

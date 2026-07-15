@@ -46,6 +46,7 @@ export interface GrokChatPreflightResult {
   model: string
   status_code?: number
   reason: string
+  retry_after_seconds?: number
 }
 
 export interface GrokRefreshTokenResult {
@@ -84,6 +85,7 @@ export interface GrokSSOToOAuthResponse {
 }
 
 const GROK_SSO_IMPORT_CONCURRENCY = 3
+const GROK_SSO_IMPORT_CHUNK_SIZE = 6
 const GROK_SSO_IMPORT_TIMEOUT_PER_BATCH_MS = 125_000
 const GROK_SSO_IMPORT_TIMEOUT_BUFFER_MS = 90_000
 
@@ -184,12 +186,26 @@ export async function resetQuota(id: number): Promise<GrokQuotaResetResult> {
 }
 
 export async function createFromSSO(payload: GrokSSOToOAuthRequest): Promise<GrokSSOToOAuthResponse> {
-  const { data } = await apiClient.post<GrokSSOToOAuthResponse>(
-    '/admin/grok/sso-to-oauth',
-    payload,
-    { timeout: getGrokSSOImportTimeout(payload.sso_tokens.length) }
-  )
-  return data
+  const aggregate: GrokSSOToOAuthResponse = { created: [], failed: [] }
+  for (let offset = 0; offset < payload.sso_tokens.length; offset += GROK_SSO_IMPORT_CHUNK_SIZE) {
+    const tokens = payload.sso_tokens.slice(offset, offset + GROK_SSO_IMPORT_CHUNK_SIZE)
+    try {
+      const { data } = await apiClient.post<GrokSSOToOAuthResponse>(
+        '/admin/grok/sso-to-oauth',
+        { ...payload, sso_tokens: tokens },
+        { timeout: getGrokSSOImportTimeout(tokens.length) }
+      )
+      aggregate.created.push(...(data.created || []).map((item) => ({ ...item, index: item.index + offset })))
+      aggregate.failed.push(...(data.failed || []).map((item) => ({ ...item, index: item.index + offset })))
+    } catch (error: any) {
+      const message = error.response?.data?.message || error.message || 'GROK_SSO_BATCH_REQUEST_FAILED'
+      for (let index = offset; index < payload.sso_tokens.length; index += 1) {
+        aggregate.failed.push({ index: index + 1, error: message })
+      }
+      break
+    }
+  }
+  return aggregate
 }
 
 export default { generateAuthUrl, exchangeCode, refreshGrokToken, queryQuota, resetQuota, createFromSSO }

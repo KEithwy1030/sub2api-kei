@@ -881,6 +881,7 @@ export default {
           failedToExchangeCode: 'Failed to exchange Grok authorization code',
           failedToValidateRT: 'Failed to validate Grok refresh token',
           failedToConvertSSO: 'Failed to convert Grok SSO cookie',
+          ssoBatchResult: 'Import complete: {active} usable, {cooling} cooling, {failed} failed',
           errors: {
             GROK_OAUTH_SESSION_NOT_FOUND:
               'Grok OAuth session was not found or has expired. Generate a new auth URL and paste the newest callback URL.',

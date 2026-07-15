@@ -968,6 +968,7 @@ export default {
           failedToExchangeCode: 'Grok 授权码兑换失败',
           failedToValidateRT: '验证 Grok refresh token 失败',
           failedToConvertSSO: 'Grok SSO 转换失败',
+          ssoBatchResult: '导入完成：{active} 个可用，{cooling} 个已进入冷却，{failed} 个失败',
           errors: {
             GROK_OAUTH_SESSION_NOT_FOUND:
               'Grok OAuth 会话不存在或已过期。请重新生成授权链接，并粘贴最新的回调链接。',
