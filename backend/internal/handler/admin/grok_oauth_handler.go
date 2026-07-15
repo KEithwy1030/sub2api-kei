@@ -430,6 +430,10 @@ func (h *GrokOAuthHandler) createAccountFromSSOToken(ctx context.Context, req Gr
 			proxyURL = proxy.URL()
 		}
 	}
+	tokenInfo, err = h.refreshConvertedGrokSSO(ctx, tokenInfo, proxyURL)
+	if err != nil {
+		return grokSSOImportWorkerResult{item: GrokSSOToOAuthItemResult{Index: index, Error: grokSSOImportErrorMessage(err)}}
+	}
 	preflight := h.probeGrokChat(ctx, tokenInfo.AccessToken, proxyURL, grokPreflightModel)
 
 	credentials := h.grokOAuthService.BuildAccountCredentials(tokenInfo)
@@ -472,6 +476,61 @@ func (h *GrokOAuthHandler) createAccountFromSSOToken(ctx context.Context, req Gr
 	}
 }
 
+func (h *GrokOAuthHandler) refreshConvertedGrokSSO(ctx context.Context, tokenInfo *service.GrokTokenInfo, proxyURL string) (*service.GrokTokenInfo, error) {
+	if tokenInfo == nil || strings.TrimSpace(tokenInfo.RefreshToken) == "" {
+		return tokenInfo, nil
+	}
+	refreshed, err := h.grokOAuthService.RefreshToken(
+		ctx,
+		tokenInfo.RefreshToken,
+		proxyURL,
+		tokenInfo.ClientID,
+	)
+	if err != nil {
+		return nil, infraerrors.Newf(
+			http.StatusBadGateway,
+			"GROK_SSO_POST_CONVERSION_REFRESH_FAILED",
+			"failed to refresh converted Grok credentials: %v",
+			err,
+		)
+	}
+	preserveGrokTokenIdentity(refreshed, tokenInfo)
+	return refreshed, nil
+}
+
+func preserveGrokTokenIdentity(target, source *service.GrokTokenInfo) {
+	if target == nil || source == nil {
+		return
+	}
+	if target.RefreshToken == "" {
+		target.RefreshToken = source.RefreshToken
+	}
+	if target.IDToken == "" {
+		target.IDToken = source.IDToken
+	}
+	if target.ClientID == "" {
+		target.ClientID = source.ClientID
+	}
+	if target.Scope == "" {
+		target.Scope = source.Scope
+	}
+	if target.Email == "" {
+		target.Email = source.Email
+	}
+	if target.Subject == "" {
+		target.Subject = source.Subject
+	}
+	if target.TeamID == "" {
+		target.TeamID = source.TeamID
+	}
+	if target.SubscriptionTier == "" {
+		target.SubscriptionTier = source.SubscriptionTier
+	}
+	if target.EntitlementStatus == "" {
+		target.EntitlementStatus = source.EntitlementStatus
+	}
+}
+
 func (h *GrokOAuthHandler) convertGrokSSOWithRetry(ctx context.Context, token string, proxyID *int64, index int) (*service.GrokTokenInfo, error) {
 	var lastErr error
 	for attempt := 0; attempt < grokSSOImportAttempts; attempt++ {
@@ -501,7 +560,7 @@ func grokSSOImportRetryable(err error) bool {
 		return false
 	}
 	switch status.Reason {
-	case "GROK_SSO_UPSTREAM_FAILED", "GROK_SSO_CONVERSION_FAILED", "GROK_SSO_TIMEOUT":
+	case "GROK_SSO_UPSTREAM_FAILED", "GROK_SSO_CONVERSION_FAILED", "GROK_SSO_TIMEOUT", "GROK_SSO_POST_CONVERSION_REFRESH_FAILED":
 		return true
 	default:
 		return false

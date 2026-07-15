@@ -72,7 +72,12 @@ func (grokSSOHandlerOAuthClient) ExchangeCode(context.Context, string, string, s
 }
 
 func (grokSSOHandlerOAuthClient) RefreshToken(context.Context, string, string, string) (*xai.TokenResponse, error) {
-	return nil, nil
+	return &xai.TokenResponse{
+		AccessToken:  "refreshed-access-token",
+		RefreshToken: "refresh-token",
+		TokenType:    "Bearer",
+		ExpiresIn:    3600,
+	}, nil
 }
 
 func (grokSSOHandlerOAuthClient) ConvertSSOToBuild(context.Context, string, string) (*xai.TokenResponse, error) {
@@ -233,9 +238,32 @@ func TestGrokSSOImportCreatesCoolingAccountWhenChatPreflightFails(t *testing.T) 
 	require.NotNil(t, result.item.Preflight)
 	require.Empty(t, result.item.Error)
 	require.Len(t, adminService.createdAccounts, 1)
+	require.Equal(t, "refreshed-access-token", adminService.createdAccounts[0].Credentials["access_token"])
+	require.Equal(t, "Bearer refreshed-access-token", upstream.lastReq.Header.Get("Authorization"))
 	require.Equal(t, int64(300), repo.tempUnschedulableID)
 	require.Equal(t, "GROK_PREFLIGHT_CHAT_PERMISSION_DENIED", repo.tempUnschedulableReason)
 	require.WithinDuration(t, time.Now().Add(30*time.Minute), repo.tempUnschedulableUntil, 2*time.Second)
+}
+
+type grokSSOHandlerRefreshErrorClient struct {
+	grokSSOHandlerOAuthClient
+}
+
+func (grokSSOHandlerRefreshErrorClient) RefreshToken(context.Context, string, string, string) (*xai.TokenResponse, error) {
+	return nil, infraerrors.New(http.StatusBadGateway, "GROK_OAUTH_REFRESH_FAILED", "refresh failed")
+}
+
+func TestGrokSSOImportDoesNotCreateAccountWhenPostConversionRefreshFails(t *testing.T) {
+	oauthService := service.NewGrokOAuthService(nil, grokSSOHandlerRefreshErrorClient{})
+	defer oauthService.Stop()
+	adminService := newStubAdminService()
+	handler := NewGrokOAuthHandler(oauthService, adminService, nil, nil, nil)
+
+	result := handler.createAccountFromSSOToken(context.Background(), GrokSSOToOAuthRequest{}, "sso-token", 1, 1)
+
+	require.False(t, result.created)
+	require.Empty(t, adminService.createdAccounts)
+	require.Contains(t, result.item.Error, "GROK_SSO_POST_CONVERSION_REFRESH_FAILED")
 }
 
 func TestGrokSSOImportUsesRetryAfterForRateLimitedAccount(t *testing.T) {
