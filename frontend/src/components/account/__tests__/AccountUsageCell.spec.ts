@@ -611,7 +611,8 @@ describe('AccountUsageCell', () => {
     expect(wrapper.text()).toContain('1.2K')
     expect(wrapper.text()).toContain('A $0.12')
     expect(wrapper.text()).toContain('U $0.34')
-    expect(wrapper.text()).toContain('admin.accounts.usageWindow.grokRequests|120|2026-07-09T16:00:00Z')
+    expect(wrapper.text()).toContain('admin.accounts.usageWindow.grokRateWindowRequests|120|2026-07-09T16:00:00Z')
+    expect(wrapper.text()).toContain('admin.accounts.usageWindow.grokRateWindowDisclaimer')
 
     const badges = wrapper.findAll('span[title]')
     expect(badges.some(node => node.attributes('title') === 'usage.accountBilled')).toBe(true)

@@ -383,18 +383,24 @@
         </div>
         <UsageProgressBar
           v-if="grokRequestQuotaBar"
-          :label="t('admin.accounts.usageWindow.grokRequests')"
+          :label="t('admin.accounts.usageWindow.grokRateWindowRequests')"
           :utilization="grokRequestQuotaBar.utilization"
           :resets-at="grokRequestQuotaBar.resetsAt"
           color="indigo"
         />
         <UsageProgressBar
           v-if="grokTokenQuotaBar"
-          :label="t('admin.accounts.usageWindow.grokTokens')"
+          :label="t('admin.accounts.usageWindow.grokRateWindowTokens')"
           :utilization="grokTokenQuotaBar.utilization"
           :resets-at="grokTokenQuotaBar.resetsAt"
           color="emerald"
         />
+        <div
+          v-if="grokRequestQuotaBar || grokTokenQuotaBar"
+          class="text-[10px] text-gray-500 dark:text-gray-400"
+        >
+          {{ t('admin.accounts.usageWindow.grokRateWindowDisclaimer') }}
+        </div>
         <div v-if="grokRetryAfterLabel" class="text-[10px] text-amber-600 dark:text-amber-400">
           {{ t('admin.accounts.usageWindow.grokRetryAfter', { time: grokRetryAfterLabel }) }}
         </div>

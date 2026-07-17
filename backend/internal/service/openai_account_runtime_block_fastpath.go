@@ -13,6 +13,7 @@ const (
 	openAIOAuth429StormWindow             = 10 * time.Second
 	openAIOAuth429StormThreshold          = 20
 	openAIOAuth429StormMaxAccountSwitches = 1
+	grokOAuth429MaxAccountSwitches        = 2
 )
 
 func openAIAccountStateContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -182,11 +183,17 @@ func (s *OpenAIGatewayService) isOpenAIOAuth429Storm() bool {
 }
 
 func (s *OpenAIGatewayService) ShouldStopOpenAIOAuth429Failover(account *Account, statusCode int, failedSwitches int) bool {
-	if statusCode != http.StatusTooManyRequests || failedSwitches < openAIOAuth429StormMaxAccountSwitches {
+	if statusCode != http.StatusTooManyRequests {
 		return false
 	}
 	if isGrokOAuthAccount(account) {
-		return true
+		// A Grok Free account's quota is independent from the other accounts in
+		// the pool. Try one alternate account, but cap the retry to avoid replaying
+		// very large CLI contexts across the whole pool.
+		return failedSwitches >= grokOAuth429MaxAccountSwitches
+	}
+	if failedSwitches < openAIOAuth429StormMaxAccountSwitches {
+		return false
 	}
 	if !isOpenAIOAuthAccount(account) {
 		return false

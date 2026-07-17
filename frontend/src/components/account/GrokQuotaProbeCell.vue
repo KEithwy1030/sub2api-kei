@@ -94,8 +94,8 @@ const summary = computed(() => {
   if (!data.value) return ''
   if (!snapshot) return t('admin.accounts.usageWindow.grokNoHeaders')
   const parts = [
-    formatWindow(t('admin.accounts.usageWindow.grokRequests'), snapshot.requests),
-    formatWindow(t('admin.accounts.usageWindow.grokTokens'), snapshot.tokens)
+    formatWindow(t('admin.accounts.usageWindow.grokRateWindowRequests'), snapshot.requests),
+    formatWindow(t('admin.accounts.usageWindow.grokRateWindowTokens'), snapshot.tokens)
   ].filter(Boolean)
   if (retryAfterLabel.value) {
     parts.push(t('admin.accounts.usageWindow.grokRetryAfter', { time: retryAfterLabel.value }))
@@ -103,7 +103,8 @@ const summary = computed(() => {
   if (snapshot.entitlement_status) {
     parts.push(snapshot.entitlement_status)
   }
-  return parts.length > 0 ? parts.join(' | ') : t('admin.accounts.usageWindow.grokNoHeaders')
+  if (parts.length === 0) return t('admin.accounts.usageWindow.grokNoHeaders')
+  return `${parts.join(' | ')} · ${t('admin.accounts.usageWindow.grokRateWindowDisclaimer')}`
 })
 
 const truncatedError = computed(() => {

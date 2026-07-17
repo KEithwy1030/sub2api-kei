@@ -43,6 +43,16 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	if err != nil {
 		return nil, err
 	}
+	patchedBody, err = applyGrokFreeResponsesPromptCacheRoute(
+		patchedBody,
+		body,
+		account,
+		getAPIKeyIDFromContext(c),
+		upstreamModel,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("apply grok Free prompt cache route: %w", err)
+	}
 
 	token, _, err := s.GetAccessToken(ctx, account)
 	if err != nil {
@@ -55,6 +65,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	if err != nil {
 		return nil, err
 	}
+	applyGrokFreePromptCacheHeader(upstreamReq.Header, patchedBody, account)
 
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
