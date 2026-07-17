@@ -26,11 +26,13 @@ type gatewayModelsResponseForTest struct {
 }
 
 type gatewayModelItemForTest struct {
-	ID        string `json:"id"`
-	Object    string `json:"object"`
-	Created   int64  `json:"created"`
-	OwnedBy   string `json:"owned_by"`
-	CreatedAt string `json:"created_at"`
+	ID            string  `json:"id"`
+	Object        string  `json:"object"`
+	Created       int64   `json:"created"`
+	OwnedBy       string  `json:"owned_by"`
+	CreatedAt     string  `json:"created_at"`
+	ContextWindow *uint64 `json:"context_window"`
+	APIBackend    string  `json:"api_backend"`
 }
 
 func (s *gatewayModelsAccountRepoStub) ListSchedulableByGroupID(ctx context.Context, groupID int64) ([]service.Account, error) {
@@ -534,6 +536,8 @@ func TestGatewayModels_OpenAICustomModelsListKeepsOpenAIResponseShapeForDefaultF
 	require.NotZero(t, got.Data[0].Created)
 	require.Equal(t, "openai", got.Data[0].OwnedBy)
 	require.Empty(t, got.Data[0].CreatedAt)
+	require.Nil(t, got.Data[0].ContextWindow)
+	require.Empty(t, got.Data[0].APIBackend)
 	require.Empty(t, got.Models)
 }
 
@@ -567,6 +571,58 @@ func TestGatewayModels_OpenAIResponseIncludesEmptyCodexModelsCatalog(t *testing.
 	require.NotEmpty(t, got.Data)
 	require.NotNil(t, got.Models)
 	require.Empty(t, got.Models)
+}
+
+func TestGatewayModels_GrokIncludesOfficialContextMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	groupID := int64(29)
+	h := newGatewayModelsHandlerForTest(
+		&gatewayModelsAccountRepoStub{
+			byGroup: map[int64][]service.Account{
+				groupID: {
+					{
+						ID:       1,
+						Platform: service.PlatformGrok,
+						Credentials: map[string]any{
+							"model_mapping": map[string]any{
+								"grok-4.5":       "grok-4.5",
+								"grok-build-0.1": "grok-build-0.1",
+							},
+						},
+					},
+				},
+			},
+		},
+	)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{
+		Group: &service.Group{ID: groupID, Platform: service.PlatformGrok},
+	})
+
+	h.Models(c)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got gatewayModelsResponseForTest
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+
+	modelsByID := make(map[string]gatewayModelItemForTest, len(got.Data))
+	for _, model := range got.Data {
+		modelsByID[model.ID] = model
+	}
+	grok45, ok := modelsByID["grok-4.5"]
+	require.True(t, ok)
+	require.NotNil(t, grok45.ContextWindow)
+	require.Equal(t, uint64(500_000), *grok45.ContextWindow)
+	require.Equal(t, "responses", grok45.APIBackend)
+
+	suggestion, ok := modelsByID["grok-build-0.1"]
+	require.True(t, ok)
+	require.Nil(t, suggestion.ContextWindow)
+	require.Equal(t, "responses", suggestion.APIBackend)
 }
 
 func modelIDsForTest(models []gatewayModelItemForTest) []string {

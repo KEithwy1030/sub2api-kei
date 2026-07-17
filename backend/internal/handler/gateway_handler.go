@@ -1013,7 +1013,7 @@ func (h *GatewayHandler) Models(c *gin.Context) {
 	}
 
 	if len(availableModels) > 0 {
-		writeModelsList(c, availableModels)
+		writeModelsList(c, platform, availableModels)
 		return
 	}
 
@@ -1036,6 +1036,11 @@ func (h *GatewayHandler) Models(c *gin.Context) {
 		return
 	}
 
+	if platform == service.PlatformGrok {
+		writeModelsList(c, platform, xai.DefaultModelIDs())
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
 		"data":   claude.DefaultModels,
@@ -1043,15 +1048,30 @@ func (h *GatewayHandler) Models(c *gin.Context) {
 	})
 }
 
-func writeModelsList(c *gin.Context, modelIDs []string) {
-	models := make([]claude.Model, 0, len(modelIDs))
+type gatewayModelListItem struct {
+	ID            string  `json:"id"`
+	Type          string  `json:"type"`
+	DisplayName   string  `json:"display_name"`
+	CreatedAt     string  `json:"created_at"`
+	ContextWindow *uint64 `json:"context_window,omitempty"`
+	APIBackend    string  `json:"api_backend,omitempty"`
+}
+
+const grok45ContextWindow = uint64(500_000)
+
+func writeModelsList(c *gin.Context, platform string, modelIDs []string) {
+	models := make([]gatewayModelListItem, 0, len(modelIDs))
 	for _, modelID := range modelIDs {
-		models = append(models, claude.Model{
+		model := gatewayModelListItem{
 			ID:          modelID,
 			Type:        "model",
 			DisplayName: modelID,
 			CreatedAt:   "2024-01-01T00:00:00Z",
-		})
+		}
+		if platform == service.PlatformGrok {
+			applyGrokModelListMetadata(&model)
+		}
+		models = append(models, model)
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
@@ -1060,12 +1080,32 @@ func writeModelsList(c *gin.Context, modelIDs []string) {
 	})
 }
 
+func applyGrokModelListMetadata(model *gatewayModelListItem) {
+	if model == nil {
+		return
+	}
+	// xAI's authenticated Grok Build catalog currently advertises a 500k
+	// window and Responses transport for the main coding model. Include the
+	// same fields so Grok CLI does not fall back to its 256k unknown-model
+	// default when it consumes this OpenAI-compatible model list.
+	switch strings.ToLower(strings.TrimSpace(model.ID)) {
+	case "grok", "grok-latest", "grok-4.5", "grok-4.5-latest", "grok-build", "grok-build-latest":
+		contextWindow := grok45ContextWindow
+		model.ContextWindow = &contextWindow
+		model.APIBackend = "responses"
+	case "grok-build-0.1":
+		// The official CLI uses this as a small prompt-suggestion model. Its
+		// requests still use Responses, but xAI does not publish a stable window.
+		model.APIBackend = "responses"
+	}
+}
+
 func writeCustomModelsList(c *gin.Context, platform string, modelIDs []string) {
 	if platform == service.PlatformOpenAI {
 		writeOpenAIModelsList(c, modelIDs)
 		return
 	}
-	writeModelsList(c, modelIDs)
+	writeModelsList(c, platform, modelIDs)
 }
 
 func writeOpenAIModelsList(c *gin.Context, modelIDs []string) {
