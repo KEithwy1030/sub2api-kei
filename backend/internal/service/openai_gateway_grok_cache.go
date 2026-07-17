@@ -163,6 +163,16 @@ func isGrokPromptCacheVerified(account *Account) bool {
 	return isKnownGrokFreeForPromptCache(account) && grokPromptCacheState(account) == grokPromptCacheStateSupported
 }
 
+func isGrokPromptCacheAliasSupported(account *Account) bool {
+	if account == nil || !account.IsGrokOAuth() {
+		return false
+	}
+	if _, matched := account.ResolveMappedModel(grokPromptCacheModelAlias); matched {
+		return true
+	}
+	return isGrokPromptCacheVerified(account)
+}
+
 func shouldProbeGrokPromptCache(account *Account, now time.Time) bool {
 	if !isKnownGrokFreeForPromptCache(account) {
 		return false

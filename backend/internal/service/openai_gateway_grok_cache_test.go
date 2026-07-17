@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -13,8 +14,10 @@ import (
 func TestApplyGrokFreeResponsesPromptCacheRoute_FunctionTools(t *testing.T) {
 	limit := int64(2_000_000)
 	account := &Account{
-		Platform: PlatformGrok,
-		Type:     AccountTypeOAuth,
+		Platform:    PlatformGrok,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
 		Extra: map[string]any{
 			grokQuotaSnapshotExtraKey: xai.QuotaSnapshot{
 				Tokens: &xai.QuotaWindow{Limit: &limit},
@@ -136,8 +139,10 @@ func TestGrokPromptCacheProbeUpdates_TransientResponsePreservesState(t *testing.
 
 func TestGrokPromptCacheAliasRequiresVerificationForFreeAccount(t *testing.T) {
 	account := &Account{
-		Platform: PlatformGrok,
-		Type:     AccountTypeOAuth,
+		Platform:    PlatformGrok,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
 		Credentials: map[string]any{
 			"subscription_tier": "free",
 			"model_mapping":     map[string]any{"grok-4.5": "grok-4.5"},
@@ -149,13 +154,16 @@ func TestGrokPromptCacheAliasRequiresVerificationForFreeAccount(t *testing.T) {
 	require.False(t, service.isModelSupportedByAccount(account, grokPromptCacheModelAlias))
 	account.Extra[grokPromptCacheStateExtraKey] = grokPromptCacheStateSupported
 	require.True(t, service.isModelSupportedByAccount(account, grokPromptCacheModelAlias))
+	require.True(t, isOpenAICompatibleAccountEligibleForRequest(context.Background(), account, PlatformGrok, grokPromptCacheModelAlias, false, ""))
 	require.Equal(t, "grok-4.5", resolveGrokUpstreamModel(account, grokPromptCacheModelAlias))
 }
 
 func TestGrokPromptCacheAliasKeepsExplicitPaidFallback(t *testing.T) {
 	account := &Account{
-		Platform: PlatformGrok,
-		Type:     AccountTypeOAuth,
+		Platform:    PlatformGrok,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
 		Credentials: map[string]any{
 			"subscription_tier": "SuperGrok",
 			"model_mapping": map[string]any{
@@ -165,6 +173,7 @@ func TestGrokPromptCacheAliasKeepsExplicitPaidFallback(t *testing.T) {
 	}
 	service := &GatewayService{}
 	require.True(t, service.isModelSupportedByAccount(account, grokPromptCacheModelAlias))
+	require.True(t, isOpenAICompatibleAccountEligibleForRequest(context.Background(), account, PlatformGrok, grokPromptCacheModelAlias, false, ""))
 	require.Equal(t, "grok-4.5", resolveGrokUpstreamModel(account, grokPromptCacheModelAlias))
 }
 
