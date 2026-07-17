@@ -129,6 +129,11 @@ func (s *ScheduledTestRunnerService) runOnePlan(ctx context.Context, plan *Sched
 	if err := s.scheduledSvc.SaveResult(ctx, plan.ID, plan.MaxResults, result); err != nil {
 		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d SaveResult error: %v", plan.ID, err)
 	}
+	if result.Status == "success" {
+		if err := s.accountTestSvc.ProbeGrokPromptCacheBackground(ctx, plan.AccountID); err != nil {
+			logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d Grok cache probe skipped: %v", plan.ID, err)
+		}
+	}
 
 	// Auto-recover account if test succeeded and auto_recover is enabled.
 	if result.Status == "success" && plan.AutoRecover {

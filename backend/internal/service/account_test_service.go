@@ -26,6 +26,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/tidwall/gjson"
 )
 
 // sseDataPrefix matches SSE data lines with optional whitespace after colon.
@@ -733,6 +734,134 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 	}
 
 	return s.processOpenAIStream(c, resp.Body)
+}
+
+// ProbeGrokPromptCacheBackground verifies cache capability without changing the
+// normal health-test result. It is intentionally called only by scheduled tests.
+func (s *AccountTestService) ProbeGrokPromptCacheBackground(ctx context.Context, accountID int64) error {
+	if s == nil || s.accountRepo == nil || s.grokTokenProvider == nil || s.httpUpstream == nil {
+		return nil
+	}
+	account, err := s.accountRepo.GetByID(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if !shouldProbeGrokPromptCache(account, time.Now()) {
+		return nil
+	}
+
+	authToken, err := s.grokTokenProvider.GetAccessToken(ctx, account)
+	if err != nil {
+		return err
+	}
+	apiURL, err := xai.BuildResponsesURL(account.GetGrokBaseURL())
+	if err != nil {
+		return err
+	}
+	payload, err := buildGrokPromptCacheProbePayload(account.ID)
+	if err != nil {
+		return err
+	}
+	cacheIdentity := generateSessionUUID(fmt.Sprintf("grok-prompt-cache-probe:v1:%d", account.ID))
+
+	first, err := s.performGrokPromptCacheProbe(ctx, account, apiURL, authToken, cacheIdentity, payload)
+	if err != nil || first.HTTPStatus != http.StatusOK {
+		return err
+	}
+	second, err := s.performGrokPromptCacheProbe(ctx, account, apiURL, authToken, cacheIdentity, payload)
+	if err != nil {
+		return err
+	}
+	updates := grokPromptCacheProbeUpdates(account, second, time.Now())
+	if len(updates) == 0 {
+		return nil
+	}
+	if err := s.accountRepo.UpdateExtra(ctx, account.ID, updates); err != nil {
+		return err
+	}
+	mergeAccountExtra(account, updates)
+	return nil
+}
+
+func buildGrokPromptCacheProbePayload(accountID int64) ([]byte, error) {
+	prefix := strings.Repeat("Sub2API prompt cache capability probe uses an identical stable prefix. ", 256)
+	return json.Marshal(map[string]any{
+		"model":             "grok-4.5",
+		"input":             prefix + "\nReply with OK only.",
+		"stream":            true,
+		"max_output_tokens": 16,
+		"prompt_cache_key":  fmt.Sprintf("sub2api-cache-probe-%d", accountID),
+		"tools": []map[string]string{
+			{"type": "web_search"},
+			{"type": "x_search"},
+		},
+		"tool_choice": "none",
+	})
+}
+
+func (s *AccountTestService) performGrokPromptCacheProbe(
+	ctx context.Context,
+	account *Account,
+	apiURL, authToken, cacheIdentity string,
+	payload []byte,
+) (grokPromptCacheProbeOutcome, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(payload))
+	if err != nil {
+		return grokPromptCacheProbeOutcome{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+authToken)
+	req.Header.Set("User-Agent", "grok-cli/0.1.250")
+	req.Header.Set(grokPromptCacheHeader, cacheIdentity)
+
+	proxyURL := ""
+	if account.ProxyID != nil && account.Proxy != nil {
+		proxyURL = account.Proxy.URL()
+	}
+	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
+	if err != nil {
+		return grokPromptCacheProbeOutcome{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return grokPromptCacheProbeOutcome{}, err
+	}
+	return grokPromptCacheProbeOutcome{
+		HTTPStatus:      resp.StatusCode,
+		CacheReadTokens: grokPromptCacheTokensFromResponse(body),
+	}, nil
+}
+
+func grokPromptCacheTokensFromResponse(body []byte) int {
+	readTokens := func(payload []byte) int {
+		paths := []string{
+			"response.usage.input_tokens_details.cached_tokens",
+			"usage.input_tokens_details.cached_tokens",
+			"response.usage.prompt_tokens_details.cached_tokens",
+			"usage.prompt_tokens_details.cached_tokens",
+		}
+		for _, path := range paths {
+			if value := gjson.GetBytes(payload, path); value.Exists() {
+				return int(value.Int())
+			}
+		}
+		return 0
+	}
+
+	maxTokens := readTokens(body)
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if tokens := readTokens(payload); tokens > maxTokens {
+			maxTokens = tokens
+		}
+	}
+	return maxTokens
 }
 
 // testOpenAIChatCompletionsConnection tests an OpenAI-compatible APIKey account

@@ -1,10 +1,13 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -14,7 +17,26 @@ const (
 	grokFreePromptCacheTokenLimit = int64(2_000_000)
 	grokFreePromptCacheToolsJSON  = `[{"type":"web_search"},{"type":"x_search"}]`
 	grokPromptCacheHeader         = "X-Grok-Conv-Id"
+	grokPromptCacheModelAlias     = "grok-4.5-cached"
+
+	grokPromptCacheStateExtraKey     = "grok_prompt_cache_state"
+	grokPromptCacheCheckedAtExtraKey = "grok_prompt_cache_checked_at"
+	grokPromptCacheSuccessesExtraKey = "grok_prompt_cache_successes"
+	grokPromptCacheFailuresExtraKey  = "grok_prompt_cache_failures"
+
+	grokPromptCacheStateUnknown     = "unknown"
+	grokPromptCacheStateSupported   = "supported"
+	grokPromptCacheStateUnsupported = "unsupported"
+
+	grokPromptCacheUnsupportedAfter = 3
+	grokPromptCacheSupportedRecheck = 7 * 24 * time.Hour
+	grokPromptCacheUnsupportedRetry = 24 * time.Hour
 )
+
+type grokPromptCacheProbeOutcome struct {
+	HTTPStatus      int
+	CacheReadTokens int
+}
 
 // applyGrokFreeResponsesPromptCacheRoute keeps Grok Free OAuth requests with
 // Responses-style function tools on xAI's cache-capable mixed-tools route.
@@ -88,6 +110,136 @@ func isKnownGrokFreeForPromptCache(account *Account) bool {
 		}
 	}
 	return freeSignal && !paidSignal
+}
+
+func isGrokPromptCacheModelAlias(model string) bool {
+	return strings.EqualFold(strings.TrimSpace(model), grokPromptCacheModelAlias)
+}
+
+func grokPromptCacheState(account *Account) string {
+	if account == nil || account.Extra == nil {
+		return grokPromptCacheStateUnknown
+	}
+	state, _ := account.Extra[grokPromptCacheStateExtraKey].(string)
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case grokPromptCacheStateSupported:
+		return grokPromptCacheStateSupported
+	case grokPromptCacheStateUnsupported:
+		return grokPromptCacheStateUnsupported
+	default:
+		return grokPromptCacheStateUnknown
+	}
+}
+
+func grokPromptCacheExtraInt(account *Account, key string) int {
+	if account == nil || account.Extra == nil {
+		return 0
+	}
+	switch value := account.Extra[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	case json.Number:
+		parsed, _ := strconv.Atoi(value.String())
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func grokPromptCacheCheckedAt(account *Account) time.Time {
+	if account == nil || account.Extra == nil {
+		return time.Time{}
+	}
+	raw, _ := account.Extra[grokPromptCacheCheckedAtExtraKey].(string)
+	checkedAt, _ := time.Parse(time.RFC3339, strings.TrimSpace(raw))
+	return checkedAt
+}
+
+func isGrokPromptCacheVerified(account *Account) bool {
+	return isKnownGrokFreeForPromptCache(account) && grokPromptCacheState(account) == grokPromptCacheStateSupported
+}
+
+func shouldProbeGrokPromptCache(account *Account, now time.Time) bool {
+	if !isKnownGrokFreeForPromptCache(account) {
+		return false
+	}
+	checkedAt := grokPromptCacheCheckedAt(account)
+	if checkedAt.IsZero() {
+		return true
+	}
+	switch grokPromptCacheState(account) {
+	case grokPromptCacheStateSupported:
+		return now.Sub(checkedAt) >= grokPromptCacheSupportedRecheck
+	case grokPromptCacheStateUnsupported:
+		return now.Sub(checkedAt) >= grokPromptCacheUnsupportedRetry
+	default:
+		return true
+	}
+}
+
+func grokPromptCacheProbeUpdates(account *Account, outcome grokPromptCacheProbeOutcome, now time.Time) map[string]any {
+	// Permission, quota and upstream failures are not evidence about cache capability.
+	if outcome.HTTPStatus != http.StatusOK {
+		return nil
+	}
+
+	successes := grokPromptCacheExtraInt(account, grokPromptCacheSuccessesExtraKey)
+	failures := grokPromptCacheExtraInt(account, grokPromptCacheFailuresExtraKey)
+	state := grokPromptCacheState(account)
+	if outcome.CacheReadTokens > 0 {
+		successes++
+		failures = 0
+		state = grokPromptCacheStateSupported
+	} else {
+		failures++
+		if failures >= grokPromptCacheUnsupportedAfter {
+			state = grokPromptCacheStateUnsupported
+		}
+	}
+	return map[string]any{
+		grokPromptCacheStateExtraKey:     state,
+		grokPromptCacheCheckedAtExtraKey: now.UTC().Format(time.RFC3339),
+		grokPromptCacheSuccessesExtraKey: successes,
+		grokPromptCacheFailuresExtraKey:  failures,
+	}
+}
+
+func resolveGrokUpstreamModel(account *Account, requestedModel string) string {
+	if account == nil {
+		return requestedModel
+	}
+	if mapped, matched := account.ResolveMappedModel(requestedModel); matched {
+		return mapped
+	}
+	if isGrokPromptCacheModelAlias(requestedModel) && isGrokPromptCacheVerified(account) {
+		return "grok-4.5"
+	}
+	return requestedModel
+}
+
+func (s *OpenAIGatewayService) observeGrokPromptCacheHit(account *Account, usage *OpenAIUsage) {
+	if s == nil || s.accountRepo == nil || account == nil || usage == nil || usage.CacheReadInputTokens <= 0 || !isKnownGrokFreeForPromptCache(account) {
+		return
+	}
+	if grokPromptCacheState(account) == grokPromptCacheStateSupported && time.Since(grokPromptCacheCheckedAt(account)) < 6*time.Hour {
+		return
+	}
+	updates := grokPromptCacheProbeUpdates(account, grokPromptCacheProbeOutcome{
+		HTTPStatus:      http.StatusOK,
+		CacheReadTokens: usage.CacheReadInputTokens,
+	}, time.Now())
+	if len(updates) == 0 {
+		return
+	}
+	go func(accountID int64, values map[string]any) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.accountRepo.UpdateExtra(ctx, accountID, values)
+	}(account.ID, updates)
 }
 
 func isGrokFreeResponsesFunctionToolIntent(tools, toolChoice gjson.Result) bool {

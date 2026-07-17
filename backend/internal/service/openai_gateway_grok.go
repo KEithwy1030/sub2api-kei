@@ -35,7 +35,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		return nil, fmt.Errorf("grok account type %s is not supported by subscription forwarding", account.Type)
 	}
 
-	upstreamModel := account.GetMappedModel(originalModel)
+	upstreamModel := resolveGrokUpstreamModel(account, originalModel)
 	if strings.TrimSpace(upstreamModel) == "" {
 		upstreamModel = "grok-4.3"
 	}
@@ -133,6 +133,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	if usage == nil {
 		usage = &OpenAIUsage{}
 	}
+	s.observeGrokPromptCacheHit(account, usage)
 	return &OpenAIForwardResult{
 		RequestID:       firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
 		ResponseID:      responseID,
