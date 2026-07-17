@@ -564,6 +564,7 @@ func filterSchedulerExtra(extra map[string]any) map[string]any {
 		"model_rate_limits",
 		"codex_image_generation_bridge",
 		"strip_image_generation_tools",
+		"grok_prompt_cache_state",
 	}
 	filtered := make(map[string]any)
 	for _, key := range keys {

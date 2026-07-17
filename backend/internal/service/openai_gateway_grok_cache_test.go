@@ -188,10 +188,11 @@ func TestGrokPromptCacheTokensFromResponse(t *testing.T) {
 
 func TestPartitionGrokPromptCacheSchedulingAccounts(t *testing.T) {
 	verifiedFree := &Account{
-		ID:          562,
-		Platform:    PlatformGrok,
-		Type:        AccountTypeOAuth,
-		Credentials: map[string]any{"subscription_tier": "free"},
+		ID:       562,
+		Platform: PlatformGrok,
+		Type:     AccountTypeOAuth,
+		// Scheduler metadata deliberately strips subscription_tier and quota details.
+		Credentials: map[string]any{"model_mapping": map[string]any{"grok-4.5": "grok-4.5"}},
 		Extra:       map[string]any{grokPromptCacheStateExtraKey: grokPromptCacheStateSupported},
 	}
 	paidFallback := &Account{

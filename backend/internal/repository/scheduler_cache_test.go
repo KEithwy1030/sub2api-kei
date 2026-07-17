@@ -35,3 +35,20 @@ func TestSchedulerMetadataAccountKeepsOpenAISubscriptionIdentity(t *testing.T) {
 	require.True(t, metadata.IsOpenAIChatGPTSubscription())
 	require.Empty(t, metadata.GetCredential("access_token"))
 }
+
+func TestSchedulerMetadataAccountKeepsGrokPromptCacheState(t *testing.T) {
+	account := service.Account{
+		ID:       562,
+		Platform: service.PlatformGrok,
+		Type:     service.AccountTypeOAuth,
+		Extra: map[string]any{
+			"grok_prompt_cache_state":      "supported",
+			"grok_prompt_cache_checked_at": "2026-07-18T00:00:00Z",
+		},
+	}
+
+	metadata := buildSchedulerMetadataAccount(account)
+
+	require.Equal(t, "supported", metadata.Extra["grok_prompt_cache_state"])
+	require.NotContains(t, metadata.Extra, "grok_prompt_cache_checked_at")
+}

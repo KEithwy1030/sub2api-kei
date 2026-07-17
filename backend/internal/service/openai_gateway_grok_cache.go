@@ -160,7 +160,7 @@ func grokPromptCacheCheckedAt(account *Account) time.Time {
 }
 
 func isGrokPromptCacheVerified(account *Account) bool {
-	return isKnownGrokFreeForPromptCache(account) && grokPromptCacheState(account) == grokPromptCacheStateSupported
+	return account != nil && account.IsGrokOAuth() && grokPromptCacheState(account) == grokPromptCacheStateSupported
 }
 
 func isGrokPromptCacheAliasSupported(account *Account) bool {
