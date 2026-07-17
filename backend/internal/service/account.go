@@ -758,6 +758,9 @@ func resolveRequestedModelInMapping(mapping map[string]string, requestedModel st
 // 请求卡死在该账号上、无法 failover 到真正支持该模型的 API Key 账号（#3662）。
 // 未知/自定义别名仍保持允许（兼容渠道级映射），见 isOpenAIOAuthServableModel。
 func (a *Account) IsModelSupported(requestedModel string) bool {
+	if a != nil && a.IsGrokOAuth() && isGrokPromptCacheModelAlias(requestedModel) {
+		return isGrokPromptCacheAliasSupported(a)
+	}
 	mapping := a.GetModelMapping()
 	if len(mapping) == 0 {
 		if a.IsOpenAIOAuth() && !a.IsOpenAIPassthroughEnabled() {

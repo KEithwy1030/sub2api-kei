@@ -2432,9 +2432,6 @@ func (s *GatewayService) isModelSupportedByAccountWithContext(ctx context.Contex
 
 // isModelSupportedByAccount 根据账户平台检查模型支持（无 context，用于非 Antigravity 平台）
 func (s *GatewayService) isModelSupportedByAccount(account *Account, requestedModel string) bool {
-	if account != nil && account.IsGrokOAuth() && isGrokPromptCacheModelAlias(requestedModel) {
-		return isGrokPromptCacheAliasSupported(account)
-	}
 	if account.Platform == PlatformAntigravity {
 		if strings.TrimSpace(requestedModel) == "" {
 			return true

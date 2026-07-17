@@ -218,14 +218,8 @@ func isOpenAICompatibleAccountEligibleForRequest(ctx context.Context, account *A
 			return false
 		}
 	}
-	if requestedModel != "" {
-		if account.IsGrokOAuth() && isGrokPromptCacheModelAlias(requestedModel) {
-			if !isGrokPromptCacheAliasSupported(account) {
-				return false
-			}
-		} else if !account.IsModelSupported(requestedModel) {
-			return false
-		}
+	if requestedModel != "" && !account.IsModelSupported(requestedModel) {
+		return false
 	}
 	if !account.SupportsOpenAIEndpointCapability(requiredCapability) {
 		return false

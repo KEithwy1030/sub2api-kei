@@ -153,8 +153,10 @@ func TestGrokPromptCacheAliasRequiresVerificationForFreeAccount(t *testing.T) {
 
 	require.False(t, service.isModelSupportedByAccount(account, grokPromptCacheModelAlias))
 	account.Extra[grokPromptCacheStateExtraKey] = grokPromptCacheStateSupported
+	require.True(t, account.IsModelSupported(grokPromptCacheModelAlias))
 	require.True(t, service.isModelSupportedByAccount(account, grokPromptCacheModelAlias))
 	require.True(t, isOpenAICompatibleAccountEligibleForRequest(context.Background(), account, PlatformGrok, grokPromptCacheModelAlias, false, ""))
+	require.True(t, (&defaultOpenAIAccountScheduler{}).isAccountRequestCompatible(context.Background(), account, OpenAIAccountScheduleRequest{RequestedModel: grokPromptCacheModelAlias}))
 	require.Equal(t, "grok-4.5", resolveGrokUpstreamModel(account, grokPromptCacheModelAlias))
 }
 
@@ -172,6 +174,7 @@ func TestGrokPromptCacheAliasKeepsExplicitPaidFallback(t *testing.T) {
 		},
 	}
 	service := &GatewayService{}
+	require.True(t, account.IsModelSupported(grokPromptCacheModelAlias))
 	require.True(t, service.isModelSupportedByAccount(account, grokPromptCacheModelAlias))
 	require.True(t, isOpenAICompatibleAccountEligibleForRequest(context.Background(), account, PlatformGrok, grokPromptCacheModelAlias, false, ""))
 	require.Equal(t, "grok-4.5", resolveGrokUpstreamModel(account, grokPromptCacheModelAlias))
