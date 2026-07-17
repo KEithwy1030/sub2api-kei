@@ -185,3 +185,29 @@ func TestGrokPromptCacheTokensFromResponse(t *testing.T) {
 	require.Equal(t, 2048, grokPromptCacheTokensFromResponse(body))
 	require.Equal(t, 512, grokPromptCacheTokensFromResponse([]byte(`{"usage":{"prompt_tokens_details":{"cached_tokens":512}}}`)))
 }
+
+func TestPartitionGrokPromptCacheSchedulingAccounts(t *testing.T) {
+	verifiedFree := &Account{
+		ID:          562,
+		Platform:    PlatformGrok,
+		Type:        AccountTypeOAuth,
+		Credentials: map[string]any{"subscription_tier": "free"},
+		Extra:       map[string]any{grokPromptCacheStateExtraKey: grokPromptCacheStateSupported},
+	}
+	paidFallback := &Account{
+		ID:       746,
+		Platform: PlatformGrok,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"model_mapping": map[string]any{grokPromptCacheModelAlias: "grok-4.5"},
+		},
+	}
+
+	primary, fallback, split := partitionGrokPromptCacheSchedulingAccounts(grokPromptCacheModelAlias, []*Account{paidFallback, verifiedFree})
+	require.True(t, split)
+	require.Equal(t, []int64{562}, []int64{primary[0].ID})
+	require.Equal(t, []int64{746}, []int64{fallback[0].ID})
+
+	_, _, split = partitionGrokPromptCacheSchedulingAccounts("grok-4.5", []*Account{paidFallback, verifiedFree})
+	require.False(t, split)
+}

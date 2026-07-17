@@ -1141,6 +1141,25 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		}
 	}
 
+	if primary, fallback, split := partitionGrokPromptCacheSchedulingAccounts(req.RequestedModel, filtered); split {
+		primaryAttempt := s.trySelectByLoadBalancePool(ctx, req, primary, loadMap)
+		if primaryAttempt.err != nil {
+			return nil, primaryAttempt.candidateCount, primaryAttempt.topK, primaryAttempt.loadSkew, primaryAttempt.err
+		}
+		if primaryAttempt.result != nil {
+			return primaryAttempt.result, primaryAttempt.candidateCount, primaryAttempt.topK, primaryAttempt.loadSkew, nil
+		}
+
+		fallbackAttempt := s.trySelectByLoadBalancePool(ctx, req, fallback, loadMap)
+		if fallbackAttempt.err != nil {
+			return nil, fallbackAttempt.candidateCount, fallbackAttempt.topK, fallbackAttempt.loadSkew, fallbackAttempt.err
+		}
+		if fallbackAttempt.result != nil {
+			return fallbackAttempt.result, fallbackAttempt.candidateCount, fallbackAttempt.topK, fallbackAttempt.loadSkew, nil
+		}
+		return s.finishLoadBalanceSelectionFallback(ctx, req, primaryAttempt)
+	}
+
 	if req.SubscriptionPriority {
 		subscriptionAccounts, regularAccounts := partitionOpenAIChatGPTSubscriptionAccounts(filtered)
 		if len(subscriptionAccounts) > 0 {
@@ -1189,6 +1208,25 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		return attempt.result, attempt.candidateCount, attempt.topK, attempt.loadSkew, nil
 	}
 	return s.finishLoadBalanceSelectionFallback(ctx, req, attempt)
+}
+
+func partitionGrokPromptCacheSchedulingAccounts(requestedModel string, accounts []*Account) (primary, fallback []*Account, split bool) {
+	if !isGrokPromptCacheModelAlias(requestedModel) {
+		return nil, nil, false
+	}
+	primary = make([]*Account, 0, len(accounts))
+	fallback = make([]*Account, 0, 1)
+	for _, account := range accounts {
+		if isGrokPromptCacheVerified(account) {
+			primary = append(primary, account)
+			continue
+		}
+		fallback = append(fallback, account)
+	}
+	if len(primary) == 0 || len(fallback) == 0 {
+		return nil, nil, false
+	}
+	return primary, fallback, true
 }
 
 func partitionOpenAIChatGPTSubscriptionAccounts(accounts []*Account) ([]*Account, []*Account) {
