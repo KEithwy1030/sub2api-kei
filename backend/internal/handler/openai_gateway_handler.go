@@ -322,6 +322,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 
 	// Generate session hash (header first; fallback to prompt_cache_key)
 	sessionHash := h.gatewayService.GenerateSessionHash(c, sessionHashBody)
+	grokSessionFingerprint := ""
+	if requestPlatform == service.PlatformGrok {
+		grokSessionFingerprint = service.GrokSessionDiagnosticFingerprint(sessionHash)
+	}
 	if h.rejectIfCyberSessionBlocked(c, apiKey, sessionHashBody, reqModel, cyberBlockFormatResponses) {
 		return
 	}
@@ -396,6 +400,16 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		)
 		account := selection.Account
 		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
+		if account.Platform == service.PlatformGrok {
+			reqLog.Info("grok.account_schedule_decision",
+				zap.String("session_fingerprint", grokSessionFingerprint),
+				zap.String("layer", scheduleDecision.Layer),
+				zap.Bool("sticky_session_hit", scheduleDecision.StickySessionHit),
+				zap.Int64("account_id", account.ID),
+				zap.Int("excluded_account_count", len(failedAccountIDs)),
+				zap.Int("switch_count", switchCount),
+			)
+		}
 		reqLog.Debug("openai.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
@@ -484,6 +498,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						zap.Int("upstream_status", failoverErr.StatusCode),
 						zap.Int("switch_count", switchCount),
 						zap.Int("max_switches", maxAccountSwitches),
+						zap.String("session_fingerprint", grokSessionFingerprint),
 					)
 					continue
 				}

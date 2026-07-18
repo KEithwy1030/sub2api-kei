@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"strings"
 	"time"
@@ -11,6 +13,13 @@ import (
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
+
+type grokPromptCacheDiagnosticContextKey struct{}
+
+type grokPromptCacheDiagnostic struct {
+	present     bool
+	fingerprint string
+}
 
 type grokStreamDiagnostics struct {
 	enabled              bool
@@ -33,6 +42,41 @@ func newGrokStreamDiagnostics(ctx context.Context, account *Account, model strin
 		resp:      resp,
 		startTime: startTime,
 	}
+}
+
+// GrokSessionDiagnosticFingerprint returns a short irreversible identifier for
+// correlating scheduling decisions. It never exposes the session hash itself.
+func GrokSessionDiagnosticFingerprint(sessionHash string) string {
+	return grokDiagnosticFingerprint("session", sessionHash)
+}
+
+func withGrokPromptCacheDiagnostic(ctx context.Context, body []byte) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	rawKey := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
+	diagnostic := grokPromptCacheDiagnostic{present: rawKey != ""}
+	if diagnostic.present {
+		diagnostic.fingerprint = grokDiagnosticFingerprint("prompt-cache", rawKey)
+	}
+	return context.WithValue(ctx, grokPromptCacheDiagnosticContextKey{}, diagnostic)
+}
+
+func grokPromptCacheDiagnosticFromContext(ctx context.Context) grokPromptCacheDiagnostic {
+	if ctx == nil {
+		return grokPromptCacheDiagnostic{}
+	}
+	diagnostic, _ := ctx.Value(grokPromptCacheDiagnosticContextKey{}).(grokPromptCacheDiagnostic)
+	return diagnostic
+}
+
+func grokDiagnosticFingerprint(namespace, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(namespace) + ":v1:" + value))
+	return hex.EncodeToString(sum[:8])
 }
 
 func (d *grokStreamDiagnostics) Observe(eventType string, payload []byte) {
@@ -103,6 +147,11 @@ func logGrokStreamStage(ctx context.Context, account *Account, model string, res
 		zap.String("client_request_id", strings.TrimSpace(clientRequestID)),
 		zap.String("upstream_request_id", strings.TrimSpace(upstreamRequestID)),
 	}
+	cacheDiagnostic := grokPromptCacheDiagnosticFromContext(ctx)
+	fields = append(fields,
+		zap.Bool("cache_key_present", cacheDiagnostic.present),
+		zap.String("cache_key_fingerprint", cacheDiagnostic.fingerprint),
+	)
 	if upstreamHTTPElapsed >= 0 {
 		fields = append(fields, zap.Int64("upstream_http_ms", upstreamHTTPElapsed.Milliseconds()))
 	}

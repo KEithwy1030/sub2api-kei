@@ -59,6 +59,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	if err != nil {
 		return nil, fmt.Errorf("apply grok Free prompt cache route: %w", err)
 	}
+	ctx = withGrokPromptCacheDiagnostic(ctx, patchedBody)
 
 	token, _, err := s.GetAccessToken(ctx, account)
 	if err != nil {
