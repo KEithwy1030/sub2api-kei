@@ -20,6 +20,7 @@ import (
 const (
 	grokComposerImageBridgeVisionModel     = "grok-build-0.1"
 	grokComposerImageBridgeMaxOutputTokens = 512
+	grokFreeUsageExhaustedCooldown         = 30 * time.Minute
 )
 
 func (s *OpenAIGatewayService) forwardGrokResponses(
@@ -678,16 +679,25 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 		s.tempUnscheduleGrok(ctx, account, 30*time.Minute, "grok entitlement or subscription tier denied")
 	case http.StatusTooManyRequests:
 		cooldown := 2 * time.Minute
+		reason := "grok rate limited"
 		if snapshot := xai.ParseQuotaHeaders(headers, statusCode); snapshot != nil && snapshot.RetryAfterSeconds != nil && *snapshot.RetryAfterSeconds > 0 {
 			cooldown = time.Duration(*snapshot.RetryAfterSeconds) * time.Second
+		} else if isGrokFreeUsageExhausted(responseBody) {
+			cooldown = grokFreeUsageExhaustedCooldown
+			reason = "grok free usage exhausted"
 		}
-		s.tempUnscheduleGrok(ctx, account, cooldown, "grok rate limited")
+		s.tempUnscheduleGrok(ctx, account, cooldown, reason)
 	default:
 		if statusCode >= 500 {
 			s.tempUnscheduleGrok(ctx, account, 2*time.Minute, "grok upstream temporary error")
 		}
 	}
-	_ = responseBody
+}
+
+func isGrokFreeUsageExhausted(responseBody []byte) bool {
+	const exhaustedCode = "subscription:free-usage-exhausted"
+	return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(responseBody, "code").String()), exhaustedCode) ||
+		strings.EqualFold(strings.TrimSpace(gjson.GetBytes(responseBody, "error.code").String()), exhaustedCode)
 }
 
 func (s *OpenAIGatewayService) tempUnscheduleGrok(ctx context.Context, account *Account, cooldown time.Duration, reason string) {

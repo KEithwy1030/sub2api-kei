@@ -910,6 +910,7 @@ func TestHandleGrokAccountUpstreamErrorTempUnschedulesReadinessStates(t *testing
 		name            string
 		status          int
 		headers         http.Header
+		responseBody    []byte
 		wantReason      string
 		wantMinCooldown time.Duration
 		wantMaxCooldown time.Duration
@@ -936,6 +937,14 @@ func TestHandleGrokAccountUpstreamErrorTempUnschedulesReadinessStates(t *testing
 			wantMinCooldown: 44 * time.Second,
 			wantMaxCooldown: 46 * time.Second,
 		},
+		{
+			name:            "free usage exhausted",
+			status:          http.StatusTooManyRequests,
+			responseBody:    []byte(`{"code":"subscription:free-usage-exhausted","error":"quota exhausted"}`),
+			wantReason:      "grok free usage exhausted",
+			wantMinCooldown: grokFreeUsageExhaustedCooldown - time.Second,
+			wantMaxCooldown: grokFreeUsageExhaustedCooldown + time.Second,
+		},
 	}
 
 	for _, tt := range tests {
@@ -945,7 +954,7 @@ func TestHandleGrokAccountUpstreamErrorTempUnschedulesReadinessStates(t *testing
 			svc := &OpenAIGatewayService{accountRepo: repo}
 			before := time.Now()
 
-			svc.handleGrokAccountUpstreamError(context.Background(), account, tt.status, tt.headers, nil)
+			svc.handleGrokAccountUpstreamError(context.Background(), account, tt.status, tt.headers, tt.responseBody)
 
 			require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 			require.Equal(t, 1, repo.tempUnschedCalls)

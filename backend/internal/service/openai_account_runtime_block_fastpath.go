@@ -13,7 +13,6 @@ const (
 	openAIOAuth429StormWindow             = 10 * time.Second
 	openAIOAuth429StormThreshold          = 20
 	openAIOAuth429StormMaxAccountSwitches = 1
-	grokOAuth429MaxAccountSwitches        = 2
 )
 
 func openAIAccountStateContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -186,11 +185,10 @@ func (s *OpenAIGatewayService) ShouldStopOpenAIOAuth429Failover(account *Account
 	if statusCode != http.StatusTooManyRequests {
 		return false
 	}
+	// Grok quotas are account-local, so the handler's configured account-switch
+	// budget should decide when the pool is exhausted.
 	if isGrokOAuthAccount(account) {
-		// A Grok Free account's quota is independent from the other accounts in
-		// the pool. Try one alternate account, but cap the retry to avoid replaying
-		// very large CLI contexts across the whole pool.
-		return failedSwitches >= grokOAuth429MaxAccountSwitches
+		return false
 	}
 	if failedSwitches < openAIOAuth429StormMaxAccountSwitches {
 		return false
