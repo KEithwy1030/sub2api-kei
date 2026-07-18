@@ -724,7 +724,6 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_StickyWeightedSessionIn
 	if selection.ReleaseFunc != nil {
 		selection.ReleaseFunc()
 	}
-
 }
 
 func TestOpenAIGatewayService_SelectAccountWithScheduler_StickyWeightedPreviousRequiresMovableContext(t *testing.T) {
