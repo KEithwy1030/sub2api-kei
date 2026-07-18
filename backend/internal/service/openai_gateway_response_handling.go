@@ -124,6 +124,7 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 	failedMessage := ""
 	clientOutputStarted := false
 	upstreamRequestID := strings.TrimSpace(resp.Header.Get("x-request-id"))
+	grokDiagnostics := newGrokStreamDiagnostics(ctx, account, originalModel, resp, startTime)
 	var streamEarlyErr error
 	sendErrorEvent := func(reason string) {
 		if errorEventSent || clientDisconnected {
@@ -235,6 +236,7 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 				sawTerminalEvent = true
 			}
 			eventType := strings.TrimSpace(gjson.GetBytes(dataBytes, "type").String())
+			grokDiagnostics.Observe(eventType, dataBytes)
 			if responseID == "" {
 				responseID = extractOpenAIResponseIDFromJSONBytes(dataBytes)
 			}

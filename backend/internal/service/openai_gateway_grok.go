@@ -80,11 +80,15 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 
 	upstreamStart := time.Now()
 	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
-	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
+	upstreamHeaderElapsed := time.Since(upstreamStart)
+	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, upstreamHeaderElapsed.Milliseconds())
 	if err != nil {
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if reqStream {
+		logGrokStreamStage(ctx, account, upstreamModel, resp, "upstream_headers", "", time.Since(startTime), upstreamHeaderElapsed)
+	}
 
 	if resp.StatusCode >= 400 {
 		respBody := s.readUpstreamErrorBody(resp)
