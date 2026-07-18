@@ -724,6 +724,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_StickyWeightedSessionIn
 	if selection.ReleaseFunc != nil {
 		selection.ReleaseFunc()
 	}
+
 }
 
 func TestOpenAIGatewayService_SelectAccountWithScheduler_StickyWeightedPreviousRequiresMovableContext(t *testing.T) {
@@ -1742,7 +1743,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyEscapeByTT
 	}
 }
 
-func TestOpenAIGatewayService_SelectAccountWithScheduler_GrokStickyEscapeRebindsHealthyAccount(t *testing.T) {
+func TestOpenAIGatewayService_SelectAccountWithScheduler_GrokStickyPreservesCacheAffinityDespiteTTFT(t *testing.T) {
 	ctx := context.Background()
 	groupID := int64(10105)
 	accounts := []Account{
@@ -1769,21 +1770,25 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_GrokStickyEscapeRebinds
 	require.NoError(t, err)
 	require.NotNil(t, selection)
 	require.NotNil(t, selection.Account)
-	require.Equal(t, int64(21602), selection.Account.ID)
-	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
-	require.False(t, decision.StickySessionHit)
-	require.Equal(t, int64(21602), cache.sessionBindings["openai:session_hash_grok_sticky_ttft"])
+	require.Equal(t, int64(21601), selection.Account.ID)
+	require.Equal(t, openAIAccountScheduleLayerSessionSticky, decision.Layer)
+	require.True(t, decision.StickySessionHit)
+	require.Equal(t, int64(21601), cache.sessionBindings["openai:session_hash_grok_sticky_ttft"])
 	if selection.ReleaseFunc != nil {
 		selection.ReleaseFunc()
 	}
 
+	for i := 0; i < 4; i++ {
+		svc.openaiAccountStats.report(21601, false, nil)
+	}
 	selection, decision, err = svc.SelectAccountWithSchedulerForCapability(ctx, &groupID, "", "session_hash_grok_sticky_ttft", "grok-4.5", nil, OpenAIUpstreamTransportAny, "", false, false, PlatformGrok)
 	require.NoError(t, err)
 	require.NotNil(t, selection)
 	require.NotNil(t, selection.Account)
 	require.Equal(t, int64(21602), selection.Account.ID)
-	require.Equal(t, openAIAccountScheduleLayerSessionSticky, decision.Layer)
-	require.True(t, decision.StickySessionHit)
+	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+	require.False(t, decision.StickySessionHit)
+	require.Equal(t, int64(21602), cache.sessionBindings["openai:session_hash_grok_sticky_ttft"])
 	if selection.ReleaseFunc != nil {
 		selection.ReleaseFunc()
 	}

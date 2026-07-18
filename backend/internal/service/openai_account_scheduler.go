@@ -467,6 +467,12 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		return nil, false, nil
 	}
 	escapeCfg := s.service.openAIStickyEscapeConfig()
+	if account.Platform == PlatformGrok {
+		// Grok large-context latency is dominated by cache warmth. Escaping an
+		// established session on historical TTFT makes the next account cold and
+		// amplifies the delay; live upstream errors still fail over normally.
+		escapeCfg.ttftMs = 0
+	}
 	if reason, errorRate, ttft, shouldEscape := s.shouldEscapeStickyAccount(accountID, escapeCfg); shouldEscape {
 		slog.Info("sticky_escape_triggered",
 			"account_id", accountID,
@@ -544,7 +550,7 @@ func (s *defaultOpenAIAccountScheduler) shouldEscapeStickyAccount(accountID int6
 		return "", 0, 0, false
 	}
 	errorRate, ttft, hasTTFT := s.stats.snapshot(accountID)
-	if hasTTFT && ttft > cfg.ttftMs {
+	if cfg.ttftMs > 0 && hasTTFT && ttft > cfg.ttftMs {
 		return "ttft", errorRate, ttft, true
 	}
 	if errorRate > cfg.errorRate {
