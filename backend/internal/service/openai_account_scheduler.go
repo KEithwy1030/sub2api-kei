@@ -351,7 +351,18 @@ func (s *defaultOpenAIAccountScheduler) Select(
 			return selection, decision, nil
 		}
 		if escapedSticky {
-			req.PreserveStickyBinding = true
+			if normalizeOpenAICompatiblePlatform(req.Platform) != PlatformGrok {
+				// Preserve the legacy temporary escape for other platforms. Grok must
+				// replace an unhealthy binding, otherwise every turn escapes the same
+				// account because its runtime health cannot recover while bypassed.
+				req.PreserveStickyBinding = true
+			} else if req.StickyAccountID > 0 {
+				req.ExcludedIDs = cloneExcludedAccountIDs(req.ExcludedIDs)
+				if req.ExcludedIDs == nil {
+					req.ExcludedIDs = make(map[int64]struct{}, 1)
+				}
+				req.ExcludedIDs[req.StickyAccountID] = struct{}{}
+			}
 		}
 	}
 
