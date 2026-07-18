@@ -323,8 +323,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	// Generate session hash (header first; fallback to prompt_cache_key)
 	sessionHash := h.gatewayService.GenerateSessionHash(c, sessionHashBody)
 	grokSessionFingerprint := ""
+	grokSessionSource := ""
 	if requestPlatform == service.PlatformGrok {
 		grokSessionFingerprint = service.GrokSessionDiagnosticFingerprint(sessionHash)
+		grokSessionSource = service.OpenAISessionDiagnosticSource(c, sessionHashBody)
 	}
 	if h.rejectIfCyberSessionBlocked(c, apiKey, sessionHashBody, reqModel, cyberBlockFormatResponses) {
 		return
@@ -403,6 +405,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		if account.Platform == service.PlatformGrok {
 			reqLog.Info("grok.account_schedule_decision",
 				zap.String("session_fingerprint", grokSessionFingerprint),
+				zap.String("session_source", grokSessionSource),
 				zap.String("layer", scheduleDecision.Layer),
 				zap.Bool("sticky_session_hit", scheduleDecision.StickySessionHit),
 				zap.Int64("account_id", account.ID),

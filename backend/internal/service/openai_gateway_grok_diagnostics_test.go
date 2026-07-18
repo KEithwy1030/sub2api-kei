@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,6 +28,19 @@ func TestWithGrokPromptCacheDiagnostic(t *testing.T) {
 	withoutKey := grokPromptCacheDiagnosticFromContext(withGrokPromptCacheDiagnostic(context.Background(), []byte(`{}`)))
 	require.False(t, withoutKey.present)
 	require.Empty(t, withoutKey.fingerprint)
+}
+
+func TestOpenAISessionDiagnosticSource(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+
+	require.Equal(t, "content_fallback", OpenAISessionDiagnosticSource(c, []byte(`{"model":"grok-4.5","input":"hello"}`)))
+	require.Equal(t, "prompt_cache_key", OpenAISessionDiagnosticSource(c, []byte(`{"prompt_cache_key":"cache-key"}`)))
+	c.Request.Header.Set("conversation_id", "conversation-id")
+	require.Equal(t, "conversation_id_header", OpenAISessionDiagnosticSource(c, []byte(`{"prompt_cache_key":"cache-key"}`)))
+	c.Request.Header.Set("session_id", "session-id")
+	require.Equal(t, "session_id_header", OpenAISessionDiagnosticSource(c, nil))
 }
 
 func TestIsGrokReasoningStreamEvent(t *testing.T) {

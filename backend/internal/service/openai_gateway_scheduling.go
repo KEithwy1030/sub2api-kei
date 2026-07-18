@@ -51,6 +51,26 @@ func explicitOpenAISessionID(c *gin.Context, body []byte) string {
 	return sessionID
 }
 
+// OpenAISessionDiagnosticSource reports which non-secret signal determines the
+// sticky session. It returns only a category and never the signal value.
+func OpenAISessionDiagnosticSource(c *gin.Context, body []byte) string {
+	if c != nil {
+		if strings.TrimSpace(c.GetHeader("session_id")) != "" {
+			return "session_id_header"
+		}
+		if strings.TrimSpace(c.GetHeader("conversation_id")) != "" {
+			return "conversation_id_header"
+		}
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String()) != "" {
+		return "prompt_cache_key"
+	}
+	if deriveOpenAIContentSessionSeed(body) != "" {
+		return "content_fallback"
+	}
+	return "none"
+}
+
 // GenerateExplicitSessionHash generates a sticky-session hash only from explicit
 // client session signals. It intentionally skips content-derived fallback and is
 // used by stateless endpoints such as /v1/images.
