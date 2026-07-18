@@ -988,3 +988,31 @@ func TestHandleGrokAccountUpstreamErrorDoesNotShortenExistingPause(t *testing.T)
 	require.True(t, ok)
 	require.WithinDuration(t, existingUntil, runtimeUntil, time.Second)
 }
+
+func TestGrokQuotaCooldownUsesObservedReset(t *testing.T) {
+	now := time.Date(2026, 7, 18, 8, 0, 0, 0, time.UTC)
+	reset := now.Add(95 * time.Second).Unix()
+	remaining := int64(0)
+	cooldown, ok := grokQuotaCooldown(&xai.QuotaSnapshot{
+		Requests: &xai.QuotaWindow{Remaining: &remaining, ResetUnix: &reset},
+	}, now)
+	require.True(t, ok)
+	require.Equal(t, 95*time.Second, cooldown)
+}
+
+func TestGrokFreeUsageExhaustedBackoffEscalatesAndResets(t *testing.T) {
+	account := &Account{ID: 63, Platform: PlatformGrok, Type: AccountTypeOAuth}
+	repo := &grokQuotaAccountRepo{}
+	svc := &OpenAIGatewayService{accountRepo: repo}
+	now := time.Date(2026, 7, 18, 8, 0, 0, 0, time.UTC)
+
+	require.Equal(t, 30*time.Minute, svc.advanceGrok429Backoff(context.Background(), account, now))
+	require.Equal(t, 2*time.Hour, svc.advanceGrok429Backoff(context.Background(), account, now.Add(31*time.Minute)))
+	require.Equal(t, 6*time.Hour, svc.advanceGrok429Backoff(context.Background(), account, now.Add(3*time.Hour)))
+	require.Equal(t, 3, grokPromptCacheExtraInt(account, grok429StreakExtraKey))
+
+	svc.resetGrok429Backoff(context.Background(), account)
+	require.Zero(t, grokPromptCacheExtraInt(account, grok429StreakExtraKey))
+	require.Equal(t, "", account.Extra[grok429LastAtExtraKey])
+	require.Equal(t, 30*time.Minute, svc.advanceGrok429Backoff(context.Background(), account, now.Add(4*time.Hour)))
+}

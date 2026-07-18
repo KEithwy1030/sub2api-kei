@@ -44,11 +44,15 @@ func TestSchedulerMetadataAccountKeepsGrokPromptCacheState(t *testing.T) {
 		Extra: map[string]any{
 			"grok_prompt_cache_state":      "supported",
 			"grok_prompt_cache_checked_at": "2026-07-18T00:00:00Z",
+			"grok_429_streak":              2,
+			"grok_429_last_at":             "2026-07-18T01:00:00Z",
 		},
 	}
 
 	metadata := buildSchedulerMetadataAccount(account)
 
 	require.Equal(t, "supported", metadata.Extra["grok_prompt_cache_state"])
+	require.Equal(t, 2, metadata.Extra["grok_429_streak"])
+	require.Equal(t, "2026-07-18T01:00:00Z", metadata.Extra["grok_429_last_at"])
 	require.NotContains(t, metadata.Extra, "grok_prompt_cache_checked_at")
 }

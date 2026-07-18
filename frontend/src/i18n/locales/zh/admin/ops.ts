@@ -751,6 +751,8 @@ export default {
         empty: '暂无数据',
         queued: '队列 {count}',
         rateLimited: '限流 {count}',
+        slowAccounts: '慢 {count}',
+        cooldownAccounts: '冷却 {count}',
         errorAccounts: '异常 {count}',
         loadFailed: '加载并发数据失败'
       },
@@ -771,6 +773,10 @@ export default {
       accountAvailability: {
         available: '可用',
         unavailable: '不可用',
+        slow: '慢',
+        cooldown: '冷却',
+        cacheSupported: '缓存已验证',
+        cacheUnknown: '缓存待验证',
         accountError: '异常'
       },
       tooltips: {

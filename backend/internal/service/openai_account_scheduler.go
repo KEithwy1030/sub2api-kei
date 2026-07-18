@@ -33,6 +33,9 @@ const (
 	openAIQuotaHeadroomNeutralFactor      = 0.5
 	openAIQuotaHeadroomSecondaryLowRemain = 0.10
 	openAIQuotaHeadroomSnapshotStaleAfter = 8 * time.Hour
+	openAIAccountRuntimeHydrateLookback   = 30 * time.Minute
+	openAIAccountRuntimeHydratePerAccount = 8
+	openAIAccountRuntimeHydrateTimeout    = 2 * time.Second
 )
 
 type cachedOpenAIAdvancedSchedulerSetting struct {
@@ -98,6 +101,12 @@ type OpenAIAccountSchedulerMetricsSnapshot struct {
 	AccountSwitchRate        float64
 	LoadSkewAvg              float64
 	RuntimeStatsAccountCount int
+}
+
+type OpenAIAccountRuntimeHealth struct {
+	ErrorRate float64
+	TTFTMs    float64
+	HasTTFT   bool
 }
 
 type OpenAIAccountScheduler interface {
@@ -166,6 +175,17 @@ func (m *openAIAccountSchedulerMetrics) recordSwitch() {
 type openAIAccountRuntimeStats struct {
 	accounts     sync.Map
 	accountCount atomic.Int64
+}
+
+type OpenAIAccountRuntimeStatSeed struct {
+	AccountID      int64
+	AverageTTFTMs  float64
+	SampleCount    int
+	LastObservedAt time.Time
+}
+
+type OpenAIAccountRuntimeStatsLoader interface {
+	ListRecentOpenAIAccountRuntimeStatSeeds(ctx context.Context, since time.Time, perAccountLimit int) ([]OpenAIAccountRuntimeStatSeed, error)
 }
 
 type openAIAccountRuntimeStat struct {
@@ -241,6 +261,16 @@ func (s *openAIAccountRuntimeStats) report(accountID int64, success bool, firstT
 			}
 		}
 	}
+}
+
+func (s *openAIAccountRuntimeStats) seed(seed OpenAIAccountRuntimeStatSeed) bool {
+	if s == nil || seed.AccountID <= 0 || seed.SampleCount <= 0 || seed.AverageTTFTMs <= 0 || math.IsNaN(seed.AverageTTFTMs) || math.IsInf(seed.AverageTTFTMs, 0) {
+		return false
+	}
+	stat := s.loadOrCreate(seed.AccountID)
+	stat.errorRateEWMABits.Store(math.Float64bits(0))
+	stat.ttftEWMABits.Store(math.Float64bits(seed.AverageTTFTMs))
+	return true
 }
 
 func (s *openAIAccountRuntimeStats) snapshot(accountID int64) (errorRate float64, ttft float64, hasTTFT bool) {
@@ -1670,12 +1700,43 @@ func (s *OpenAIGatewayService) getOpenAIAccountScheduler(ctx context.Context) Op
 	s.openaiSchedulerOnce.Do(func() {
 		if s.openaiAccountStats == nil {
 			s.openaiAccountStats = newOpenAIAccountRuntimeStats()
+			s.hydrateOpenAIAccountRuntimeStats(ctx, s.openaiAccountStats)
 		}
 		if s.openaiScheduler == nil {
 			s.openaiScheduler = newDefaultOpenAIAccountScheduler(s, s.openaiAccountStats)
 		}
 	})
 	return s.openaiScheduler
+}
+
+func (s *OpenAIGatewayService) hydrateOpenAIAccountRuntimeStats(ctx context.Context, stats *openAIAccountRuntimeStats) {
+	if s == nil || stats == nil || s.usageLogRepo == nil {
+		return
+	}
+	loader, ok := s.usageLogRepo.(OpenAIAccountRuntimeStatsLoader)
+	if !ok {
+		return
+	}
+	hydrateCtx, cancel := context.WithTimeout(context.Background(), openAIAccountRuntimeHydrateTimeout)
+	defer cancel()
+	seeds, err := loader.ListRecentOpenAIAccountRuntimeStatSeeds(
+		hydrateCtx,
+		time.Now().Add(-openAIAccountRuntimeHydrateLookback),
+		openAIAccountRuntimeHydratePerAccount,
+	)
+	if err != nil {
+		slog.Warn("openai_account_runtime_hydrate_failed", "error", err)
+		return
+	}
+	hydrated := 0
+	for _, seed := range seeds {
+		if stats.seed(seed) {
+			hydrated++
+		}
+	}
+	if hydrated > 0 {
+		slog.Info("openai_account_runtime_hydrated", "accounts", hydrated, "lookback_minutes", int(openAIAccountRuntimeHydrateLookback.Minutes()))
+	}
 }
 
 func resetOpenAIAdvancedSchedulerSettingCacheForTest() {
@@ -1912,6 +1973,20 @@ func (s *OpenAIGatewayService) SnapshotOpenAIAccountSchedulerMetrics() OpenAIAcc
 		return OpenAIAccountSchedulerMetricsSnapshot{}
 	}
 	return scheduler.SnapshotMetrics()
+}
+
+func (s *OpenAIGatewayService) SnapshotOpenAIAccountRuntimeHealth(ctx context.Context, accountID int64) OpenAIAccountRuntimeHealth {
+	if s == nil || accountID <= 0 {
+		return OpenAIAccountRuntimeHealth{}
+	}
+	if s.openaiAccountStats == nil {
+		_ = s.getOpenAIAccountScheduler(ctx)
+	}
+	if s.openaiAccountStats == nil {
+		return OpenAIAccountRuntimeHealth{}
+	}
+	errorRate, ttft, hasTTFT := s.openaiAccountStats.snapshot(accountID)
+	return OpenAIAccountRuntimeHealth{ErrorRate: errorRate, TTFTMs: ttft, HasTTFT: hasTTFT}
 }
 
 func (s *OpenAIGatewayService) openAIWSSessionStickyTTL() time.Duration {

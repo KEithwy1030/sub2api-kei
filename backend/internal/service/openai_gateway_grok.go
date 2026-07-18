@@ -21,6 +21,11 @@ const (
 	grokComposerImageBridgeVisionModel     = "grok-build-0.1"
 	grokComposerImageBridgeMaxOutputTokens = 512
 	grokFreeUsageExhaustedCooldown         = 30 * time.Minute
+	grokFreeUsageExhaustedSecondCooldown   = 2 * time.Hour
+	grokFreeUsageExhaustedMaxCooldown      = 6 * time.Hour
+	grokFreeUsageExhaustedStreakResetAfter = 12 * time.Hour
+	grok429StreakExtraKey                  = "grok_429_streak"
+	grok429LastAtExtraKey                  = "grok_429_last_at"
 )
 
 func (s *OpenAIGatewayService) forwardGrokResponses(
@@ -134,6 +139,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	if usage == nil {
 		usage = &OpenAIUsage{}
 	}
+	s.resetGrok429Backoff(ctx, account)
 	s.observeGrokPromptCacheHit(account, usage)
 	return &OpenAIForwardResult{
 		RequestID:       firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
@@ -527,6 +533,7 @@ func (s *OpenAIGatewayService) describeGrokComposerImage(
 	if description == "" {
 		return "", copyOpenAIUsageFromResponsesUsage(parsed.Usage), fmt.Errorf("grok composer image bridge returned empty description")
 	}
+	s.resetGrok429Backoff(ctx, account)
 	return description, copyOpenAIUsageFromResponsesUsage(parsed.Usage), nil
 }
 
@@ -680,10 +687,11 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 	case http.StatusTooManyRequests:
 		cooldown := 2 * time.Minute
 		reason := "grok rate limited"
-		if snapshot := xai.ParseQuotaHeaders(headers, statusCode); snapshot != nil && snapshot.RetryAfterSeconds != nil && *snapshot.RetryAfterSeconds > 0 {
-			cooldown = time.Duration(*snapshot.RetryAfterSeconds) * time.Second
+		snapshot := xai.ParseQuotaHeaders(headers, statusCode)
+		if quotaCooldown, ok := grokQuotaCooldown(snapshot, time.Now()); ok {
+			cooldown = quotaCooldown
 		} else if isGrokFreeUsageExhausted(responseBody) {
-			cooldown = grokFreeUsageExhaustedCooldown
+			cooldown = s.advanceGrok429Backoff(ctx, account, time.Now())
 			reason = "grok free usage exhausted"
 		}
 		s.tempUnscheduleGrok(ctx, account, cooldown, reason)
@@ -691,6 +699,80 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 		if statusCode >= 500 {
 			s.tempUnscheduleGrok(ctx, account, 2*time.Minute, "grok upstream temporary error")
 		}
+	}
+}
+
+func grokQuotaCooldown(snapshot *xai.QuotaSnapshot, now time.Time) (time.Duration, bool) {
+	if snapshot == nil {
+		return 0, false
+	}
+	if snapshot.RetryAfterSeconds != nil && *snapshot.RetryAfterSeconds > 0 {
+		return time.Duration(*snapshot.RetryAfterSeconds) * time.Second, true
+	}
+	latestReset := int64(0)
+	for _, window := range []*xai.QuotaWindow{snapshot.Requests, snapshot.Tokens} {
+		if window == nil || window.ResetUnix == nil || *window.ResetUnix <= now.Unix() {
+			continue
+		}
+		if window.Remaining != nil && *window.Remaining > 0 {
+			continue
+		}
+		if *window.ResetUnix > latestReset {
+			latestReset = *window.ResetUnix
+		}
+	}
+	if latestReset <= 0 {
+		return 0, false
+	}
+	return time.Unix(latestReset, 0).Sub(now), true
+}
+
+func (s *OpenAIGatewayService) advanceGrok429Backoff(ctx context.Context, account *Account, now time.Time) time.Duration {
+	streak := grokPromptCacheExtraInt(account, grok429StreakExtraKey)
+	if raw, _ := account.Extra[grok429LastAtExtraKey].(string); strings.TrimSpace(raw) != "" {
+		lastAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(raw))
+		if err != nil || now.Sub(lastAt) > grokFreeUsageExhaustedStreakResetAfter || now.Before(lastAt) {
+			streak = 0
+		}
+	} else {
+		streak = 0
+	}
+	streak++
+	cooldown := grokFreeUsageExhaustedCooldown
+	switch streak {
+	case 1:
+		cooldown = grokFreeUsageExhaustedCooldown
+	case 2:
+		cooldown = grokFreeUsageExhaustedSecondCooldown
+	default:
+		cooldown = grokFreeUsageExhaustedMaxCooldown
+	}
+	updates := map[string]any{
+		grok429StreakExtraKey: streak,
+		grok429LastAtExtraKey: now.UTC().Format(time.RFC3339Nano),
+	}
+	mergeAccountExtra(account, updates)
+	if s != nil && s.accountRepo != nil {
+		stateCtx, cancel := openAIAccountStateContext(ctx)
+		defer cancel()
+		_ = s.accountRepo.UpdateExtra(stateCtx, account.ID, updates)
+	}
+	return cooldown
+}
+
+func (s *OpenAIGatewayService) resetGrok429Backoff(ctx context.Context, account *Account) {
+	if s == nil || account == nil || grokPromptCacheExtraInt(account, grok429StreakExtraKey) <= 0 {
+		return
+	}
+	updates := map[string]any{
+		grok429StreakExtraKey: 0,
+		grok429LastAtExtraKey: "",
+	}
+	mergeAccountExtra(account, updates)
+	if s.accountRepo != nil {
+		stateCtx, cancel := openAIAccountStateContext(ctx)
+		defer cancel()
+		_ = s.accountRepo.UpdateExtra(stateCtx, account.ID, updates)
 	}
 }
 

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -58,6 +59,23 @@ func (s *OpsService) GetAccountAvailabilityStats(ctx context.Context, platformFi
 		isRateLimited := acc.RateLimitResetAt != nil && now.Before(*acc.RateLimitResetAt)
 		isOverloaded := acc.OverloadUntil != nil && now.Before(*acc.OverloadUntil)
 		hasError := acc.Status == StatusError
+		isSlow := false
+		grokCacheState := ""
+		var recentTTFTMs *int64
+		var recentErrorRate *float64
+		if s.openAIGatewayService != nil && acc.IsOpenAICompatible() {
+			health := s.openAIGatewayService.SnapshotOpenAIAccountRuntimeHealth(ctx, acc.ID)
+			if health.HasTTFT {
+				ttft := int64(health.TTFTMs)
+				recentTTFTMs = &ttft
+				errorRate := health.ErrorRate
+				recentErrorRate = &errorRate
+				isSlow = health.TTFTMs > s.openAIGatewayService.openAIStickyEscapeConfig().ttftMs
+			}
+		}
+		if acc.IsGrok() {
+			grokCacheState = grokPromptCacheState(&acc)
+		}
 
 		// Normalize exclusive status flags so the UI doesn't show conflicting badges.
 		if hasError {
@@ -84,6 +102,12 @@ func (s *OpsService) GetAccountAvailabilityStats(ctx context.Context, platformFi
 			if hasError {
 				p.ErrorCount++
 			}
+			if isSlow {
+				p.SlowCount++
+			}
+			if isTempUnsched {
+				p.CooldownCount++
+			}
 		}
 
 		for _, grp := range acc.Groups {
@@ -108,6 +132,12 @@ func (s *OpsService) GetAccountAvailabilityStats(ctx context.Context, platformFi
 			if hasError {
 				g.ErrorCount++
 			}
+			if isSlow {
+				g.SlowCount++
+			}
+			if isTempUnsched {
+				g.CooldownCount++
+			}
 		}
 
 		displayGroupID := int64(0)
@@ -129,8 +159,14 @@ func (s *OpsService) GetAccountAvailabilityStats(ctx context.Context, platformFi
 			IsRateLimited: isRateLimited,
 			IsOverloaded:  isOverloaded,
 			HasError:      hasError,
+			IsSlow:        isSlow,
 
-			ErrorMessage: acc.ErrorMessage,
+			AvailabilityState:       accountAvailabilityState(acc, isAvailable, isRateLimited, isOverloaded, isTempUnsched, isSlow, hasError),
+			ErrorMessage:            acc.ErrorMessage,
+			TempUnschedulableReason: acc.TempUnschedulableReason,
+			RecentTTFTMs:            recentTTFTMs,
+			RecentErrorRate:         recentErrorRate,
+			GrokPromptCacheState:    grokCacheState,
 		}
 
 		if isRateLimited && acc.RateLimitResetAt != nil {
@@ -155,6 +191,31 @@ func (s *OpsService) GetAccountAvailabilityStats(ctx context.Context, platformFi
 	}
 
 	return platform, group, account, &collectedAt, nil
+}
+
+func accountAvailabilityState(acc Account, isAvailable, isRateLimited, isOverloaded, isTempUnsched, isSlow, hasError bool) string {
+	switch {
+	case hasError:
+		return "error"
+	case isRateLimited:
+		return "rate_limited"
+	case isOverloaded:
+		return "overloaded"
+	case isTempUnsched && strings.Contains(strings.ToLower(acc.TempUnschedulableReason), "403"):
+		return "cooldown_403"
+	case isTempUnsched && (strings.Contains(strings.ToLower(acc.TempUnschedulableReason), "entitlement") || strings.Contains(strings.ToLower(acc.TempUnschedulableReason), "permission")):
+		return "cooldown_403"
+	case isTempUnsched && (strings.Contains(strings.ToLower(acc.TempUnschedulableReason), "429") || strings.Contains(strings.ToLower(acc.TempUnschedulableReason), "usage exhausted") || strings.Contains(strings.ToLower(acc.TempUnschedulableReason), "rate limited")):
+		return "cooldown_429"
+	case isTempUnsched:
+		return "cooldown"
+	case isSlow:
+		return "slow"
+	case isAvailable:
+		return "available"
+	default:
+		return "unavailable"
+	}
 }
 
 type OpsAccountAvailability struct {

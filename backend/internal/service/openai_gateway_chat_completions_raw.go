@@ -205,6 +205,9 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 	if result != nil {
 		addOpenAIUsage(&result.Usage, bridgeUsage)
 	}
+	if forwardErr == nil && account.Platform == PlatformGrok {
+		s.resetGrok429Backoff(ctx, account)
+	}
 	return result, forwardErr
 }
 

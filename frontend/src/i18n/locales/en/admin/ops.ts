@@ -750,6 +750,8 @@ export default {
         empty: 'No data',
         queued: 'Queue {count}',
         rateLimited: 'Rate-limited {count}',
+        slowAccounts: 'Slow {count}',
+        cooldownAccounts: 'Cooldown {count}',
         errorAccounts: 'Errors {count}',
         loadFailed: 'Failed to load concurrency data'
       },
@@ -770,6 +772,10 @@ export default {
       accountAvailability: {
         available: 'Available',
         unavailable: 'Unavailable',
+        slow: 'Slow',
+        cooldown: 'Cooldown',
+        cacheSupported: 'Cache verified',
+        cacheUnknown: 'Cache pending',
         accountError: 'Error'
       },
       tooltips: {

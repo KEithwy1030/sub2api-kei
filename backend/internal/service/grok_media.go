@@ -368,6 +368,7 @@ func (s *OpenAIGatewayService) ForwardGrokMedia(
 	}
 	writeGrokMediaResponse(c, resp, respBody, s.responseHeaderFilter)
 	usage := grokMediaUsageFromResponse(endpoint, requestInfo, respBody)
+	s.resetGrok429Backoff(ctx, account)
 	return &OpenAIForwardResult{
 		RequestID:            requestIDHeader,
 		ResponseID:           usage.ResponseID,

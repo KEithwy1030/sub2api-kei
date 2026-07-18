@@ -55,6 +55,8 @@ type PlatformAvailability struct {
 	AvailableCount int64  `json:"available_count"`
 	RateLimitCount int64  `json:"rate_limit_count"`
 	ErrorCount     int64  `json:"error_count"`
+	SlowCount      int64  `json:"slow_count"`
+	CooldownCount  int64  `json:"cooldown_count"`
 }
 
 // GroupAvailability aggregates account availability by group.
@@ -66,6 +68,8 @@ type GroupAvailability struct {
 	AvailableCount int64  `json:"available_count"`
 	RateLimitCount int64  `json:"rate_limit_count"`
 	ErrorCount     int64  `json:"error_count"`
+	SlowCount      int64  `json:"slow_count"`
+	CooldownCount  int64  `json:"cooldown_count"`
 }
 
 // AccountAvailability represents current availability for a single account.
@@ -82,11 +86,18 @@ type AccountAvailability struct {
 	IsRateLimited bool `json:"is_rate_limited"`
 	IsOverloaded  bool `json:"is_overloaded"`
 	HasError      bool `json:"has_error"`
+	IsSlow        bool `json:"is_slow"`
 
-	RateLimitResetAt       *time.Time `json:"rate_limit_reset_at"`
-	RateLimitRemainingSec  *int64     `json:"rate_limit_remaining_sec"`
-	OverloadUntil          *time.Time `json:"overload_until"`
-	OverloadRemainingSec   *int64     `json:"overload_remaining_sec"`
-	ErrorMessage           string     `json:"error_message"`
-	TempUnschedulableUntil *time.Time `json:"temp_unschedulable_until,omitempty"`
+	AvailabilityState string `json:"availability_state"`
+
+	RateLimitResetAt        *time.Time `json:"rate_limit_reset_at"`
+	RateLimitRemainingSec   *int64     `json:"rate_limit_remaining_sec"`
+	OverloadUntil           *time.Time `json:"overload_until"`
+	OverloadRemainingSec    *int64     `json:"overload_remaining_sec"`
+	ErrorMessage            string     `json:"error_message"`
+	TempUnschedulableUntil  *time.Time `json:"temp_unschedulable_until,omitempty"`
+	TempUnschedulableReason string     `json:"temp_unschedulable_reason,omitempty"`
+	RecentTTFTMs            *int64     `json:"recent_ttft_ms,omitempty"`
+	RecentErrorRate         *float64   `json:"recent_error_rate,omitempty"`
+	GrokPromptCacheState    string     `json:"grok_prompt_cache_state,omitempty"`
 }

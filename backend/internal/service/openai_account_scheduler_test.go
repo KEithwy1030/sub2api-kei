@@ -24,6 +24,16 @@ type schedulerTestOpenAIAccountRepo struct {
 	accounts []Account
 }
 
+type schedulerRuntimeSeedUsageRepo struct {
+	UsageLogRepository
+	seeds []OpenAIAccountRuntimeStatSeed
+	err   error
+}
+
+func (r schedulerRuntimeSeedUsageRepo) ListRecentOpenAIAccountRuntimeStatSeeds(_ context.Context, _ time.Time, _ int) ([]OpenAIAccountRuntimeStatSeed, error) {
+	return r.seeds, r.err
+}
+
 func (r schedulerTestOpenAIAccountRepo) GetByID(ctx context.Context, id int64) (*Account, error) {
 	for i := range r.accounts {
 		if r.accounts[i].ID == id {
@@ -2164,6 +2174,26 @@ func TestDefaultOpenAIAccountScheduler_ShouldEscapeStickyAccount_ThresholdBounda
 	require.Empty(t, reason)
 	require.InDelta(t, 0.655936, errorRate, 1e-9)
 	require.InDelta(t, 15000, observedTTFT, 1e-9)
+}
+
+func TestOpenAIGatewayService_HydrateOpenAIAccountRuntimeStats(t *testing.T) {
+	stats := newOpenAIAccountRuntimeStats()
+	svc := &OpenAIGatewayService{
+		usageLogRepo: schedulerRuntimeSeedUsageRepo{seeds: []OpenAIAccountRuntimeStatSeed{
+			{AccountID: 301, AverageTTFTMs: 24500, SampleCount: 4, LastObservedAt: time.Now()},
+			{AccountID: 302, AverageTTFTMs: 3200, SampleCount: 2, LastObservedAt: time.Now()},
+			{AccountID: 0, AverageTTFTMs: 99999, SampleCount: 1, LastObservedAt: time.Now()},
+		}},
+	}
+
+	svc.hydrateOpenAIAccountRuntimeStats(context.Background(), stats)
+
+	errorRate, ttft, hasTTFT := stats.snapshot(301)
+	require.True(t, hasTTFT)
+	require.Zero(t, errorRate)
+	require.InDelta(t, 24500, ttft, 0.001)
+	_, _, hasInvalidSeed := stats.snapshot(0)
+	require.False(t, hasInvalidSeed)
 }
 
 func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionSticky_ForceHTTP(t *testing.T) {

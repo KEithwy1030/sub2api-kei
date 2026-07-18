@@ -362,6 +362,8 @@ export interface PlatformAvailability {
   available_count: number
   rate_limit_count: number
   error_count: number
+  slow_count: number
+  cooldown_count: number
 }
 
 export interface GroupAvailability {
@@ -372,6 +374,8 @@ export interface GroupAvailability {
   available_count: number
   rate_limit_count: number
   error_count: number
+  slow_count: number
+  cooldown_count: number
 }
 
 export interface AccountAvailability {
@@ -390,6 +394,13 @@ export interface AccountAvailability {
   overload_remaining_sec?: number
   has_error: boolean
   error_message?: string
+  is_slow: boolean
+  availability_state: 'available' | 'slow' | 'cooldown_429' | 'cooldown_403' | 'cooldown' | 'rate_limited' | 'overloaded' | 'error' | 'unavailable'
+  temp_unschedulable_until?: string
+  temp_unschedulable_reason?: string
+  recent_ttft_ms?: number
+  recent_error_rate?: number
+  grok_prompt_cache_state?: string
 }
 
 export interface OpsAccountAvailabilityStatsResponse {

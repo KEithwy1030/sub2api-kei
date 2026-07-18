@@ -383,6 +383,7 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	if handleErr == nil && account.Type == AccountTypeOAuth && !account.IsShadow() {
 		if account.Platform == PlatformGrok {
 			s.updateGrokUsageSnapshot(ctx, account.ID, xai.ParseQuotaHeaders(resp.Header, resp.StatusCode))
+			s.resetGrok429Backoff(ctx, account)
 		} else if snapshot := ParseCodexRateLimitHeaders(resp.Header); snapshot != nil {
 			s.updateCodexUsageSnapshot(ctx, account.ID, snapshot)
 		}

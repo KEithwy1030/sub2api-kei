@@ -57,6 +57,8 @@ interface SummaryRow {
   available_accounts: number
   rate_limited_accounts: number
   error_accounts: number
+  slow_accounts: number
+  cooldown_accounts: number
   // 并发统计
   total_concurrency: number
   used_concurrency: number
@@ -85,6 +87,11 @@ interface AccountRow {
   overload_remaining_sec?: number
   has_error: boolean
   error_message?: string
+  is_slow: boolean
+  availability_state: string
+  temp_unschedulable_until?: string
+  recent_ttft_ms?: number
+  grok_prompt_cache_state?: string
 }
 
 // 用户行数据
@@ -123,6 +130,8 @@ const platformRows = computed((): SummaryRow[] => {
       rate_limited_accounts: safeNumber(avail.rate_limit_count),
 
       error_accounts: safeNumber(avail.error_count),
+      slow_accounts: safeNumber(avail.slow_count),
+      cooldown_accounts: safeNumber(avail.cooldown_count),
       total_concurrency: totalConcurrency,
       used_concurrency: usedConcurrency,
       waiting_in_queue: safeNumber(conc.waiting_in_queue),
@@ -163,6 +172,8 @@ const groupRows = computed((): SummaryRow[] => {
         rate_limited_accounts: safeNumber(avail.rate_limit_count),
   
         error_accounts: safeNumber(avail.error_count),
+        slow_accounts: safeNumber(avail.slow_count),
+        cooldown_accounts: safeNumber(avail.cooldown_count),
         total_concurrency: totalConcurrency,
         used_concurrency: usedConcurrency,
         waiting_in_queue: safeNumber(conc.waiting_in_queue),
@@ -209,7 +220,12 @@ const accountRows = computed((): AccountRow[] => {
         is_overloaded: avail.is_overloaded || false,
         overload_remaining_sec: avail.overload_remaining_sec,
         has_error: avail.has_error || false,
-        error_message: avail.error_message || ''
+        error_message: avail.error_message || '',
+        is_slow: avail.is_slow || false,
+        availability_state: avail.availability_state || 'unavailable',
+        temp_unschedulable_until: avail.temp_unschedulable_until,
+        recent_ttft_ms: avail.recent_ttft_ms,
+        grok_prompt_cache_state: avail.grok_prompt_cache_state
       }
     })
     .filter((row): row is NonNullable<typeof row> => row !== null)
@@ -217,6 +233,8 @@ const accountRows = computed((): AccountRow[] => {
   return rows.sort((a, b) => {
     // 优先显示异常账号
     if (a.has_error !== b.has_error) return a.has_error ? -1 : 1
+    if (a.availability_state.startsWith('cooldown') !== b.availability_state.startsWith('cooldown')) return a.availability_state.startsWith('cooldown') ? -1 : 1
+    if (a.is_slow !== b.is_slow) return a.is_slow ? -1 : 1
     if (a.is_rate_limited !== b.is_rate_limited) return a.is_rate_limited ? -1 : 1
     // 然后按负载排序
     return b.load_percentage - a.load_percentage
@@ -326,6 +344,12 @@ function formatDuration(seconds: number): string {
   if (minutes < 60) return `${minutes}m`
   const hours = Math.floor(minutes / 60)
   return `${hours}h`
+}
+
+function formatRemainingUntil(value?: string): string {
+  if (!value) return ''
+  const remaining = (new Date(value).getTime() - Date.now()) / 1000
+  return formatDuration(Math.max(0, remaining))
 }
 
 
@@ -498,6 +522,20 @@ watch(
 
             <!-- 异常账号 -->
             <span
+              v-if="row.slow_accounts > 0"
+              class="rounded-full bg-orange-100 px-1.5 py-0.5 font-semibold text-orange-700 dark:bg-orange-900/30 dark:text-orange-400"
+            >
+              {{ t('admin.ops.concurrency.slowAccounts', { count: row.slow_accounts }) }}
+            </span>
+
+            <span
+              v-if="row.cooldown_accounts > 0"
+              class="rounded-full bg-gray-200 px-1.5 py-0.5 font-semibold text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+            >
+              {{ t('admin.ops.concurrency.cooldownAccounts', { count: row.cooldown_accounts }) }}
+            </span>
+
+            <span
               v-if="row.error_accounts > 0"
               class="rounded-full bg-red-100 px-1.5 py-0.5 font-semibold text-red-700 dark:bg-red-900/30 dark:text-red-400"
             >
@@ -524,8 +562,11 @@ watch(
               <div class="truncate text-[11px] font-bold text-gray-900 dark:text-white" :title="row.name">
                 {{ row.name }}
               </div>
-              <div class="mt-0.5 text-[9px] text-gray-400 dark:text-gray-500">
-                {{ row.group_name }}
+              <div class="mt-0.5 flex items-center gap-2 text-[9px] text-gray-400 dark:text-gray-500">
+                <span>{{ row.group_name }}</span>
+                <span v-if="row.platform === 'grok' && row.grok_prompt_cache_state">
+                  {{ row.grok_prompt_cache_state === 'supported' ? t('admin.ops.accountAvailability.cacheSupported') : t('admin.ops.accountAvailability.cacheUnknown') }}
+                </span>
               </div>
             </div>
             <div class="flex shrink-0 items-center gap-2">
@@ -533,7 +574,27 @@ watch(
               <span class="font-mono text-[11px] font-bold text-gray-900 dark:text-white"> {{ row.current_in_use }}/{{ row.max_capacity }} </span>
               <!-- 状态徽章 -->
               <span
-                v-if="row.is_available"
+                v-if="row.has_error"
+                class="inline-flex items-center gap-1 rounded bg-red-100 px-1.5 py-0.5 text-[10px] font-medium text-red-700 dark:bg-red-900/30 dark:text-red-400"
+              >
+                {{ t('admin.ops.accountAvailability.accountError') }}
+              </span>
+              <span
+                v-else-if="row.availability_state === 'cooldown_429' || row.availability_state === 'cooldown_403' || row.availability_state === 'cooldown'"
+                class="inline-flex items-center gap-1 rounded bg-gray-200 px-1.5 py-0.5 text-[10px] font-medium text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+              >
+                {{ row.availability_state === 'cooldown_429' ? '429' : row.availability_state === 'cooldown_403' ? '403' : t('admin.ops.accountAvailability.cooldown') }}
+                <span v-if="row.temp_unschedulable_until">{{ formatRemainingUntil(row.temp_unschedulable_until) }}</span>
+              </span>
+              <span
+                v-else-if="row.is_slow"
+                class="inline-flex items-center gap-1 rounded bg-orange-100 px-1.5 py-0.5 text-[10px] font-medium text-orange-700 dark:bg-orange-900/30 dark:text-orange-400"
+              >
+                {{ t('admin.ops.accountAvailability.slow') }}
+                <span v-if="row.recent_ttft_ms">{{ (row.recent_ttft_ms / 1000).toFixed(1) }}s</span>
+              </span>
+              <span
+                v-else-if="row.is_available"
                 class="inline-flex items-center gap-1 rounded bg-green-100 px-1.5 py-0.5 text-[10px] font-medium text-green-700 dark:bg-green-900/30 dark:text-green-400"
               >
                 <svg class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -563,15 +624,6 @@ watch(
                   />
                 </svg>
                 {{ formatDuration(row.overload_remaining_sec || 0) }}
-              </span>
-              <span
-                v-else-if="row.has_error"
-                class="inline-flex items-center gap-1 rounded bg-red-100 px-1.5 py-0.5 text-[10px] font-medium text-red-700 dark:bg-red-900/30 dark:text-red-400"
-              >
-                <svg class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-                {{ t('admin.ops.accountAvailability.accountError') }}
               </span>
               <span
                 v-else
