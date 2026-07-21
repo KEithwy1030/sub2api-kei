@@ -360,11 +360,15 @@ func isGrokCLICompatibilityAccessDenied(body []byte) bool {
 		Code  string `json:"code"`
 		Error string `json:"error"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil || !strings.EqualFold(strings.TrimSpace(payload.Code), "permission_denied") {
+	if err := json.Unmarshal(body, &payload); err != nil || normalizeGrokErrorCode(payload.Code) != "permission_denied" {
 		return false
 	}
 	const chatEndpointDeniedPrefix = "access to the chat endpoint is denied. please ensure you're using the correct credentials. if you believe this is a mistake, please"
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(payload.Error)), chatEndpointDeniedPrefix)
+}
+
+func normalizeGrokErrorCode(value string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(value)), "-", "_")
 }
 
 func isGrokCLIAccessDeniedFallbackCandidate(req *http.Request, resp *http.Response) bool {

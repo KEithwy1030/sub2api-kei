@@ -9,7 +9,7 @@ import (
 )
 
 func permanentGrokTestError() string {
-	return `Grok Responses API returned 403: {"code":"permission_denied","error":"Access to the chat endpoint is denied. Please ensure you're using the correct credentials. If you believe this is a mistake, please contact support."}`
+	return `Grok Responses API returned 403: {"code":"permission-denied","error":"Access to the chat endpoint is denied. Please ensure you're using the correct credentials. If you believe this is a mistake, please log into console.x.ai and update the permissions, or contact support."}`
 }
 
 func TestIsPermanentGrokScheduledTestFailureIsStrict(t *testing.T) {
@@ -19,6 +19,7 @@ func TestIsPermanentGrokScheduledTestFailureIsStrict(t *testing.T) {
 		want bool
 	}{
 		{name: "observed permission denial", text: permanentGrokTestError(), want: true},
+		{name: "underscore spelling", text: `Grok Responses API returned 403: {"code":"permission_denied","error":"Access to the chat endpoint is denied. Please ensure you're using the correct credentials. If you believe this is a mistake, please contact support."}`, want: true},
 		{name: "rate limit", text: `Grok Responses API returned 429: {"code":"rate_limited"}`},
 		{name: "generic forbidden", text: `Grok Responses API returned 403: {"error":"Access denied"}`},
 		{name: "subscription wording", text: `Grok Responses API returned 403: {"code":"permission_denied","error":"Access to the chat endpoint is denied because a subscription is required"}`},

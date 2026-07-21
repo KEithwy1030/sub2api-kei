@@ -102,11 +102,15 @@ func isPermanentGrokScheduledTestFailure(message string) bool {
 		Code  string `json:"code"`
 		Error string `json:"error"`
 	}
-	if json.Unmarshal([]byte(body), &payload) != nil || !strings.EqualFold(strings.TrimSpace(payload.Code), "permission_denied") {
+	if json.Unmarshal([]byte(body), &payload) != nil || normalizeScheduledGrokErrorCode(payload.Code) != "permission_denied" {
 		return false
 	}
 	const deniedPrefix = "access to the chat endpoint is denied. please ensure you're using the correct credentials. if you believe this is a mistake, please"
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(payload.Error)), deniedPrefix)
+}
+
+func normalizeScheduledGrokErrorCode(value string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(value)), "-", "_")
 }
 
 func anyString(value any) string {

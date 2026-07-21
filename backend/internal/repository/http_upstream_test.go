@@ -360,6 +360,11 @@ func TestIsGrokCLICompatibilityAccessDenied(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "observed hyphenated permission denial",
+			body: `{"code":"permission-denied","error":"Access to the chat endpoint is denied. Please ensure you're using the correct credentials. If you believe this is a mistake, please log into console.x.ai and update the permissions, or contact support."}`,
+			want: true,
+		},
+		{
 			name: "entitlement denial using the same broad terms",
 			body: `{"code":"permission_denied","error":"Access to the chat endpoint is denied because a subscription is required"}`,
 			want: false,
