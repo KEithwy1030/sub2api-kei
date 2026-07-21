@@ -17,6 +17,7 @@ type ScheduledTestRunnerService struct {
 	planRepo       ScheduledTestPlanRepository
 	scheduledSvc   *ScheduledTestService
 	accountTestSvc *AccountTestService
+	accountRepo    scheduledTestCleanupAccountRepository
 	rateLimitSvc   *RateLimitService
 	cfg            *config.Config
 
@@ -30,6 +31,7 @@ func NewScheduledTestRunnerService(
 	planRepo ScheduledTestPlanRepository,
 	scheduledSvc *ScheduledTestService,
 	accountTestSvc *AccountTestService,
+	accountRepo AccountRepository,
 	rateLimitSvc *RateLimitService,
 	cfg *config.Config,
 ) *ScheduledTestRunnerService {
@@ -37,6 +39,7 @@ func NewScheduledTestRunnerService(
 		planRepo:       planRepo,
 		scheduledSvc:   scheduledSvc,
 		accountTestSvc: accountTestSvc,
+		accountRepo:    accountRepo,
 		rateLimitSvc:   rateLimitSvc,
 		cfg:            cfg,
 	}
@@ -126,8 +129,14 @@ func (s *ScheduledTestRunnerService) runOnePlan(ctx context.Context, plan *Sched
 		return
 	}
 
+	resultSaved := true
 	if err := s.scheduledSvc.SaveResult(ctx, plan.ID, plan.MaxResults, result); err != nil {
+		resultSaved = false
 		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d SaveResult error: %v", plan.ID, err)
+	}
+
+	if resultSaved && s.tryRetirePermanentlyUnavailableAutomatedGrok(ctx, plan, result) {
+		return
 	}
 
 	// Auto-recover account if test succeeded and auto_recover is enabled.
