@@ -1207,6 +1207,16 @@ type GatewayOpenAISchedulerConfig struct {
 	StickyEscapeTTFTMs int `mapstructure:"sticky_escape_ttft_ms"`
 	// StickyEscapeErrorRate: 错误率 EWMA 超过该阈值时跳过 sticky
 	StickyEscapeErrorRate float64 `mapstructure:"sticky_escape_error_rate"`
+	// GrokSlowQuarantineEnabled: 对指定分组的 Grok 慢账号启用模型级临时隔离。
+	GrokSlowQuarantineEnabled bool `mapstructure:"grok_slow_quarantine_enabled"`
+	// GrokSlowQuarantineGroupIDs: 允许触发慢账号隔离的分组白名单。
+	GrokSlowQuarantineGroupIDs []int64 `mapstructure:"grok_slow_quarantine_group_ids"`
+	// GrokSlowQuarantineTTFTMs: 单次 TTFT 超过该阈值视为慢样本。
+	GrokSlowQuarantineTTFTMs int `mapstructure:"grok_slow_quarantine_ttft_ms"`
+	// GrokSlowQuarantineConsecutive: 连续慢样本达到该次数后触发隔离。
+	GrokSlowQuarantineConsecutive int `mapstructure:"grok_slow_quarantine_consecutive"`
+	// GrokSlowQuarantineSeconds: 模型级隔离持续时间。
+	GrokSlowQuarantineSeconds int `mapstructure:"grok_slow_quarantine_seconds"`
 }
 
 // GatewayUsageRecordConfig 使用量记录异步队列配置
@@ -2230,6 +2240,11 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.upstream_cost", 0.0)
 	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.previous_response", 5.0)
 	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.session_sticky", 3.0)
+	viper.SetDefault("gateway.openai_scheduler.grok_slow_quarantine_enabled", false)
+	viper.SetDefault("gateway.openai_scheduler.grok_slow_quarantine_group_ids", []int64{})
+	viper.SetDefault("gateway.openai_scheduler.grok_slow_quarantine_ttft_ms", 20000)
+	viper.SetDefault("gateway.openai_scheduler.grok_slow_quarantine_consecutive", 2)
+	viper.SetDefault("gateway.openai_scheduler.grok_slow_quarantine_seconds", 900)
 	// OpenAI HTTP upstream protocol strategy
 	viper.SetDefault("gateway.openai_http2.enabled", true)
 	viper.SetDefault("gateway.openai_http2.allow_proxy_fallback_to_http1", true)
@@ -3254,6 +3269,25 @@ func (c *Config) Validate() error {
 	}
 	if c.Gateway.OpenAIScheduler.StickyEscapeErrorRate < 0 || c.Gateway.OpenAIScheduler.StickyEscapeErrorRate > 1 {
 		return fmt.Errorf("gateway.openai_scheduler.sticky_escape_error_rate must be between 0 and 1")
+	}
+	if c.Gateway.OpenAIScheduler.GrokSlowQuarantineEnabled {
+		if c.Gateway.OpenAIScheduler.GrokSlowQuarantineTTFTMs <= 0 {
+			return fmt.Errorf("gateway.openai_scheduler.grok_slow_quarantine_ttft_ms must be positive")
+		}
+		if c.Gateway.OpenAIScheduler.GrokSlowQuarantineConsecutive <= 0 {
+			return fmt.Errorf("gateway.openai_scheduler.grok_slow_quarantine_consecutive must be positive")
+		}
+		if c.Gateway.OpenAIScheduler.GrokSlowQuarantineSeconds <= 0 {
+			return fmt.Errorf("gateway.openai_scheduler.grok_slow_quarantine_seconds must be positive")
+		}
+		if len(c.Gateway.OpenAIScheduler.GrokSlowQuarantineGroupIDs) == 0 {
+			return fmt.Errorf("gateway.openai_scheduler.grok_slow_quarantine_group_ids must not be empty when enabled")
+		}
+		for _, groupID := range c.Gateway.OpenAIScheduler.GrokSlowQuarantineGroupIDs {
+			if groupID <= 0 {
+				return fmt.Errorf("gateway.openai_scheduler.grok_slow_quarantine_group_ids must contain only positive IDs")
+			}
+		}
 	}
 	if c.Gateway.MaxLineSize < 0 {
 		return fmt.Errorf("gateway.max_line_size must be non-negative")

@@ -21,6 +21,35 @@ import (
 	"go.uber.org/zap"
 )
 
+const grokMessagesAccountSwitchContextKey = "grok_messages_account_switch"
+
+// SetGrokMessagesAccountSwitch records a scheduler-confirmed account change.
+// A missing prior binding is not enough evidence to discard valid reasoning.
+func SetGrokMessagesAccountSwitch(c *gin.Context, previousAccountID, selectedAccountID int64) {
+	if c != nil {
+		c.Set(grokMessagesAccountSwitchContextKey, previousAccountID > 0 && selectedAccountID > 0 && previousAccountID != selectedAccountID)
+	}
+}
+
+func grokMessagesAccountSwitched(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	value, exists := c.Get(grokMessagesAccountSwitchContextKey)
+	switched, ok := value.(bool)
+	return exists && ok && switched
+}
+
+func prepareGrokMessagesBodyForAffinity(c *gin.Context, account *Account, body []byte) ([]byte, bool) {
+	if account == nil || account.Platform != PlatformGrok {
+		return body, false
+	}
+	if !grokMessagesAccountSwitched(c) {
+		return body, false
+	}
+	return stripAnthropicThinkingSignatures(body)
+}
+
 // ForwardAsAnthropic accepts an Anthropic Messages request body, converts it
 // to OpenAI Responses API format, forwards to the OpenAI upstream, and converts
 // the response back to Anthropic Messages format. This enables Claude Code
@@ -39,6 +68,12 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	// /v1/chat/completions 的第三方 OpenAI 兼容上游全部 400。
 	if account.Type == AccountTypeAPIKey && !openai_compat.ShouldUseResponsesAPI(account.Extra) {
 		return s.forwardAnthropicViaRawChatCompletions(ctx, c, account, body, defaultMappedModel)
+	}
+	if strippedBody, changed := prepareGrokMessagesBodyForAffinity(c, account, body); changed {
+		body = strippedBody
+		logger.L().Info("openai messages: stripped Grok encrypted thinking before cross-account send",
+			zap.Int64("account_id", account.ID),
+		)
 	}
 
 	startTime := time.Now()

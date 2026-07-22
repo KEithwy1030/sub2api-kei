@@ -434,6 +434,8 @@ type OpenAIGatewayService struct {
 	codexModelsManifestCache            codexModelsManifestCache
 	openaiCompatSessionResponses        sync.Map
 	openaiCompatAnthropicDigestSessions sync.Map
+	grokSlowTTFTQuarantineStats         sync.Map // key: account+model, value: *grokSlowTTFTQuarantineStat
+	grokSlowTTFTQuarantineUntil         sync.Map // key: account+model, value: time.Time
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

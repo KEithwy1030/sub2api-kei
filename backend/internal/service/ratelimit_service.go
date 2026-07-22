@@ -47,7 +47,8 @@ type SuccessfulTestRecoveryResult struct {
 
 // AccountRecoveryOptions 控制账号恢复时的附加行为。
 type AccountRecoveryOptions struct {
-	InvalidateToken bool
+	InvalidateToken                  bool
+	PreserveActiveGrokSlowQuarantine bool
 }
 
 type geminiUsageCacheEntry struct {
@@ -1732,14 +1733,28 @@ func (s *RateLimitService) samplePassiveUsageFromHeaders(ctx context.Context, ac
 
 // ClearRateLimit 清除账号的限流状态
 func (s *RateLimitService) ClearRateLimit(ctx context.Context, accountID int64) error {
+	return s.clearRateLimit(ctx, accountID, false)
+}
+
+func (s *RateLimitService) clearRateLimit(ctx context.Context, accountID int64, preserveActiveGrokSlowQuarantine bool) error {
 	if err := s.accountRepo.ClearRateLimit(ctx, accountID); err != nil {
 		return err
 	}
 	if err := s.accountRepo.ClearAntigravityQuotaScopes(ctx, accountID); err != nil {
 		return err
 	}
-	if err := s.accountRepo.ClearModelRateLimits(ctx, accountID); err != nil {
-		return err
+	if preserveActiveGrokSlowQuarantine {
+		stateRepo, ok := s.accountRepo.(grokSlowQuarantineRecoveryRepository)
+		if !ok {
+			return fmt.Errorf("conditional Grok slow quarantine repository is unavailable")
+		}
+		if err := stateRepo.ClearModelRateLimitsExceptActiveReasonPrefix(ctx, accountID, grokSlowTTFTQuarantineReasonPrefix, time.Now()); err != nil {
+			return err
+		}
+	} else {
+		if err := s.accountRepo.ClearModelRateLimits(ctx, accountID); err != nil {
+			return err
+		}
 	}
 	// 清除限流时一并清理临时不可调度状态，避免周限/窗口重置后仍被本地临时状态阻断。
 	if err := s.accountRepo.ClearTempUnschedulable(ctx, accountID); err != nil {
@@ -1785,7 +1800,7 @@ func (s *RateLimitService) RecoverAccountState(ctx context.Context, accountID in
 	}
 
 	if hasRecoverableRuntimeState(account) {
-		if err := s.ClearRateLimit(ctx, accountID); err != nil {
+		if err := s.clearRateLimit(ctx, accountID, options.PreserveActiveGrokSlowQuarantine); err != nil {
 			return nil, err
 		}
 		result.ClearedRateLimit = true
@@ -1803,7 +1818,7 @@ func (s *RateLimitService) RecoverAccountState(ctx context.Context, accountID in
 // RecoverAccountAfterSuccessfulTest 将一次成功测试视为正常请求，
 // 按需恢复 error / rate-limit / overload / temp-unsched / model-rate-limit 等运行时状态。
 func (s *RateLimitService) RecoverAccountAfterSuccessfulTest(ctx context.Context, accountID int64) (*SuccessfulTestRecoveryResult, error) {
-	return s.RecoverAccountState(ctx, accountID, AccountRecoveryOptions{})
+	return s.RecoverAccountState(ctx, accountID, AccountRecoveryOptions{PreserveActiveGrokSlowQuarantine: true})
 }
 
 func (s *RateLimitService) ClearTempUnschedulable(ctx context.Context, accountID int64) error {

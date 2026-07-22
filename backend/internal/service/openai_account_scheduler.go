@@ -86,15 +86,16 @@ type OpenAIAccountScheduleRequest struct {
 }
 
 type OpenAIAccountScheduleDecision struct {
-	Layer               string
-	StickyPreviousHit   bool
-	StickySessionHit    bool
-	CandidateCount      int
-	TopK                int
-	LatencyMs           int64
-	LoadSkew            float64
-	SelectedAccountID   int64
-	SelectedAccountType string
+	Layer                   string
+	StickyPreviousHit       bool
+	StickySessionHit        bool
+	PreviousStickyAccountID int64
+	CandidateCount          int
+	TopK                    int
+	LatencyMs               int64
+	LoadSkew                float64
+	SelectedAccountID       int64
+	SelectedAccountType     string
 }
 
 type OpenAIAccountSchedulerMetricsSnapshot struct {
@@ -369,7 +370,7 @@ func (s *defaultOpenAIAccountScheduler) Select(
 	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
-	decision := OpenAIAccountScheduleDecision{}
+	decision := OpenAIAccountScheduleDecision{PreviousStickyAccountID: req.StickyAccountID}
 	start := time.Now()
 	defer func() {
 		decision.LatencyMs = time.Since(start).Milliseconds()

@@ -595,7 +595,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			if account.Type == service.AccountTypeOAuth && !account.IsShadow() {
 				h.gatewayService.UpdateCodexUsageSnapshotFromHeaders(c.Request.Context(), account.ID, result.ResponseHeaders)
 			}
-			h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, account.GetMappedModel(reqModel), openAIForwardSucceededForScheduling(result), result.FirstTokenMs)
+			canonicalModel := account.GetMappedModel(reqModel)
+			scheduleSuccess := openAIForwardSucceededForScheduling(result)
+			h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, canonicalModel, scheduleSuccess, result.FirstTokenMs)
+			if scheduleSuccess {
+				h.gatewayService.EvaluateGrokSlowTTFTQuarantine(c.Request.Context(), apiKey.GroupID, account, reqModel, result.FirstTokenMs)
+			}
 		} else {
 			h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, account.GetMappedModel(reqModel), openAIForwardSucceededForScheduling(result), nil)
 		}
@@ -979,7 +984,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		account := selection.Account
 		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
 		reqLog.Debug("openai_messages.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
-		_ = scheduleDecision
+		service.SetGrokMessagesAccountSwitch(c, scheduleDecision.PreviousStickyAccountID, account.ID)
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		accountReleaseFunc, acquired := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
@@ -1102,7 +1107,9 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			}
 		}
 		if result != nil {
-			h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, account.GetMappedModel(currentRoutingModel), true, result.FirstTokenMs)
+			canonicalModel := account.GetMappedModel(currentRoutingModel)
+			h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, canonicalModel, true, result.FirstTokenMs)
+			h.gatewayService.EvaluateGrokSlowTTFTQuarantine(c.Request.Context(), apiKey.GroupID, account, currentRoutingModel, result.FirstTokenMs)
 		} else {
 			h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, account.GetMappedModel(currentRoutingModel), true, nil)
 		}
@@ -1817,7 +1824,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				if account.Type == service.AccountTypeOAuth && !account.IsShadow() {
 					h.gatewayService.UpdateCodexUsageSnapshotFromHeaders(ctx, account.ID, result.ResponseHeaders)
 				}
-				h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, account.GetMappedModel(reqModel), openAIForwardSucceededForScheduling(result), result.FirstTokenMs)
+				canonicalModel := account.GetMappedModel(reqModel)
+				scheduleSuccess := openAIForwardSucceededForScheduling(result)
+				h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, canonicalModel, scheduleSuccess, result.FirstTokenMs)
+				if scheduleSuccess {
+					h.gatewayService.EvaluateGrokSlowTTFTQuarantine(ctx, apiKey.GroupID, account, reqModel, result.FirstTokenMs)
+				}
 				inboundEndpoint := GetInboundEndpoint(c)
 				upstreamEndpoint := resolveOpenAIUpstreamEndpoint(c, account, result)
 				quotaPlatform := service.QuotaPlatform(c.Request.Context(), apiKey)

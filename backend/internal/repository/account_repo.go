@@ -2096,6 +2096,66 @@ func (r *accountRepository) SetModelRateLimit(ctx context.Context, id int64, sco
 	return nil
 }
 
+func (r *accountRepository) SetModelRateLimitIfInactive(
+	ctx context.Context,
+	id int64,
+	scope string,
+	resetAt time.Time,
+	reason string,
+	observedAt time.Time,
+) (bool, error) {
+	if scope == "" {
+		return false, nil
+	}
+	payload := map[string]string{
+		"rate_limited_at":     observedAt.UTC().Format(time.RFC3339),
+		"rate_limit_reset_at": resetAt.UTC().Format(time.RFC3339),
+	}
+	if value := strings.TrimSpace(reason); value != "" {
+		payload["reason"] = value
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return false, err
+	}
+
+	result, err := r.sql.ExecContext(ctx, `
+		UPDATE accounts AS a
+		SET extra = jsonb_set(
+			jsonb_set(COALESCE(a.extra, '{}'::jsonb), '{model_rate_limits}'::text[], COALESCE(a.extra->'model_rate_limits', '{}'::jsonb), true),
+			ARRAY['model_rate_limits', $1]::text[],
+			$2::jsonb,
+			true
+		),
+		updated_at = NOW()
+		WHERE a.id = $3
+			AND a.deleted_at IS NULL
+			AND CASE
+				WHEN NULLIF(a.extra->'model_rate_limits'->$1->>'rate_limit_reset_at', '') IS NULL THEN TRUE
+				ELSE (a.extra->'model_rate_limits'->$1->>'rate_limit_reset_at')::timestamptz <= $4
+			END`,
+		scope,
+		raw,
+		id,
+		observedAt.UTC(),
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue conditional model rate limit failed: account=%d err=%v", id, err)
+	}
+	r.syncSchedulerAccountSnapshot(ctx, id)
+	return true, nil
+}
+
 func (r *accountRepository) SetOverloaded(ctx context.Context, id int64, until time.Time) error {
 	_, err := r.client.Account.Update().
 		Where(dbaccount.IDEQ(id)).
@@ -2263,6 +2323,63 @@ func (r *accountRepository) ClearModelRateLimits(ctx context.Context, id int64) 
 	}
 	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
 		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue clear model rate limit failed: account=%d err=%v", id, err)
+	}
+	r.syncSchedulerAccountSnapshot(ctx, id)
+	return nil
+}
+
+func (r *accountRepository) ClearModelRateLimitsExceptActiveReasonPrefix(
+	ctx context.Context,
+	id int64,
+	reasonPrefix string,
+	observedAt time.Time,
+) error {
+	result, err := r.sql.ExecContext(ctx, `
+		WITH locked AS MATERIALIZED (
+			SELECT a.id, a.extra
+			FROM accounts AS a
+			WHERE a.id = $1 AND a.deleted_at IS NULL
+			FOR UPDATE
+		),
+		preserved AS (
+			SELECT locked.id,
+				COALESCE(
+					jsonb_object_agg(entry.key, entry.value) FILTER (
+						WHERE entry.key IS NOT NULL
+							AND LEFT(COALESCE(entry.value->>'reason', ''), LENGTH($2)) = $2
+							AND NULLIF(entry.value->>'rate_limit_reset_at', '') IS NOT NULL
+							AND (entry.value->>'rate_limit_reset_at')::timestamptz > $3
+					),
+					'{}'::jsonb
+				) AS model_limits
+			FROM locked
+			LEFT JOIN LATERAL jsonb_each(COALESCE(locked.extra->'model_rate_limits', '{}'::jsonb)) AS entry ON TRUE
+			GROUP BY locked.id
+		)
+		UPDATE accounts AS a
+		SET extra = CASE
+				WHEN preserved.model_limits = '{}'::jsonb THEN COALESCE(a.extra, '{}'::jsonb) - 'model_rate_limits'
+				ELSE jsonb_set(COALESCE(a.extra, '{}'::jsonb), '{model_rate_limits}'::text[], preserved.model_limits, true)
+			END,
+			updated_at = NOW()
+		FROM preserved
+		WHERE a.id = preserved.id`,
+		id,
+		reasonPrefix,
+		observedAt.UTC(),
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return service.ErrAccountNotFound
+	}
+	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue selective model rate-limit clear failed: account=%d err=%v", id, err)
 	}
 	r.syncSchedulerAccountSnapshot(ctx, id)
 	return nil
