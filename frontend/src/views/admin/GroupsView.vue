@@ -5172,8 +5172,11 @@ const deleteConfirmMessage = computed(() => {
 const loadLiveCapability = async () => {
   if (liveCapability.value) return liveCapability.value;
   if (!liveCapabilityRequest) {
-    liveCapabilityRequest = adminAPI.groups
-      .getLiveCapability()
+    const capabilityRequest =
+      typeof adminAPI.groups.getLiveCapability === "function"
+        ? adminAPI.groups.getLiveCapability()
+        : Promise.resolve({ supported: false });
+    liveCapabilityRequest = capabilityRequest
       .catch(() => ({ supported: false }))
       .finally(() => {
         liveCapabilityRequest = null;
