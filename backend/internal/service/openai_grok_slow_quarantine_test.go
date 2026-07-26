@@ -112,6 +112,30 @@ func TestEvaluateGrokSlowTTFTQuarantineIsGroupAndPlatformScoped(t *testing.T) {
 	}
 }
 
+func TestGrokSlowTTFTStickyAffinityBypassesOnlySlowQuarantine(t *testing.T) {
+	resetAt := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	account := &Account{
+		Platform:    PlatformGrok,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra: map[string]any{
+			modelRateLimitsKey: map[string]any{
+				"grok-4.5": map[string]any{
+					"rate_limit_reset_at": resetAt,
+					"reason":              "grok slow ttft quarantine: 25000ms (2 consecutive)",
+				},
+			},
+		},
+	}
+	stickyCtx := withGrokSlowTTFTStickyAffinity(context.Background(), account)
+
+	require.True(t, shouldClearStickySession(account, "grok-4.5"), "new sessions must treat slow quarantine as blocked")
+	require.False(t, shouldClearStickySessionWithContext(stickyCtx, account, "grok-4.5"), "existing sticky sessions must preserve cache affinity")
+
+	account.Extra[modelRateLimitsKey].(map[string]any)["grok-4.5"].(map[string]any)["reason"] = "upstream 429 rate limit"
+	require.True(t, shouldClearStickySessionWithContext(stickyCtx, account, "grok-4.5"), "real upstream rate limits must still break affinity")
+}
+
 func TestEvaluateGrokSlowTTFTQuarantineMapsRequestedModelOnce(t *testing.T) {
 	repo := &grokSlowQuarantineAccountRepo{calls: make(chan grokSlowQuarantineModelLimitCall, 1)}
 	cfg := &config.Config{}

@@ -2314,6 +2314,64 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_GrokStickyPreservesCach
 	}
 }
 
+func TestOpenAIGatewayService_SelectAccountWithScheduler_GrokSlowQuarantineOnlyBlocksNewSessions(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(10106)
+	resetAt := time.Now().Add(24 * time.Hour)
+	accounts := []Account{
+		{
+			ID:          21611,
+			Platform:    PlatformGrok,
+			Type:        AccountTypeOAuth,
+			Status:      StatusActive,
+			Schedulable: true,
+			Concurrency: 1,
+			Priority:    0,
+			GroupIDs:    []int64{groupID},
+			Extra: map[string]any{
+				modelRateLimitsKey: map[string]any{
+					"grok-4.5": map[string]any{
+						"rate_limit_reset_at": resetAt.UTC().Format(time.RFC3339),
+						"reason":              "grok slow ttft quarantine: 25000ms (2 consecutive)",
+					},
+				},
+			},
+		},
+		{ID: 21612, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 1, GroupIDs: []int64{groupID}},
+	}
+	cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{"openai:session_hash_grok_slow_sticky": 21611}}
+	svc := &OpenAIGatewayService{
+		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: accounts},
+		cache:              cache,
+		cfg:                &config.Config{},
+		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("true"),
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{acquireResults: map[int64]bool{21611: true, 21612: true}}),
+		openaiAccountStats: newOpenAIAccountRuntimeStats(),
+	}
+	svc.grokSlowTTFTQuarantineUntil.Store(openAIAccountModelKey{AccountID: 21611, Model: "grok-4.5"}, resetAt)
+
+	selection, decision, err := svc.SelectAccountWithSchedulerForCapability(ctx, &groupID, "", "session_hash_grok_slow_sticky", "grok-4.5", nil, OpenAIUpstreamTransportAny, "", false, false, false, PlatformGrok)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.Equal(t, int64(21611), selection.Account.ID, "an existing warm session must stay on its slow-quarantined account")
+	require.Equal(t, openAIAccountScheduleLayerSessionSticky, decision.Layer)
+	require.True(t, decision.StickySessionHit)
+	require.Equal(t, int64(21611), cache.sessionBindings["openai:session_hash_grok_slow_sticky"])
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+
+	selection, decision, err = svc.SelectAccountWithSchedulerForCapability(ctx, &groupID, "", "session_hash_grok_slow_new", "grok-4.5", nil, OpenAIUpstreamTransportAny, "", false, false, false, PlatformGrok)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.Equal(t, int64(21612), selection.Account.ID, "a new session must skip the slow-quarantined account")
+	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+	require.False(t, decision.StickySessionHit)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
 func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyEscapeByErrorRate(t *testing.T) {
 	ctx := context.Background()
 	groupID := int64(10102)

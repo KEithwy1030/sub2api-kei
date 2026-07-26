@@ -11,6 +11,26 @@ import (
 
 const grokSlowTTFTQuarantineReasonPrefix = "grok slow ttft quarantine:"
 
+type grokSlowTTFTStickyAffinityContextKey struct{}
+
+func withGrokSlowTTFTStickyAffinity(ctx context.Context, account *Account) context.Context {
+	if account == nil || account.Platform != PlatformGrok {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, grokSlowTTFTStickyAffinityContextKey{}, true)
+}
+
+func preserveGrokSlowTTFTStickyAffinity(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	preserve, _ := ctx.Value(grokSlowTTFTStickyAffinityContextKey{}).(bool)
+	return preserve
+}
+
 type grokSlowTTFTQuarantineStat struct {
 	mu          sync.Mutex
 	consecutive int
@@ -215,15 +235,26 @@ func isActiveGrokSlowTTFTModelRateLimit(account *Account, now time.Time) bool {
 	if !ok {
 		return false
 	}
-	for _, rawLimit := range rawLimits {
-		limit, ok := rawLimit.(map[string]any)
-		if !ok || !strings.HasPrefix(strings.TrimSpace(anyString(limit["reason"])), grokSlowTTFTQuarantineReasonPrefix) {
-			continue
-		}
-		resetAt, err := time.Parse(time.RFC3339, strings.TrimSpace(anyString(limit["rate_limit_reset_at"])))
-		if err == nil && now.Before(resetAt) {
+	for key := range rawLimits {
+		if isActiveGrokSlowTTFTModelRateLimitKey(account, key, now) {
 			return true
 		}
 	}
 	return false
+}
+
+func isActiveGrokSlowTTFTModelRateLimitKey(account *Account, key string, now time.Time) bool {
+	if account == nil || account.Platform != PlatformGrok || account.Extra == nil || strings.TrimSpace(key) == "" {
+		return false
+	}
+	rawLimits, ok := account.Extra[modelRateLimitsKey].(map[string]any)
+	if !ok {
+		return false
+	}
+	limit, ok := rawLimits[key].(map[string]any)
+	if !ok || !strings.HasPrefix(strings.TrimSpace(anyString(limit["reason"])), grokSlowTTFTQuarantineReasonPrefix) {
+		return false
+	}
+	resetAt, err := time.Parse(time.RFC3339, strings.TrimSpace(anyString(limit["rate_limit_reset_at"])))
+	return err == nil && now.Before(resetAt)
 }
