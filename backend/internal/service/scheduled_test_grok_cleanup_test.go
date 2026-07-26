@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/stretchr/testify/require"
 )
 
@@ -135,4 +136,27 @@ func TestAutomatedGrokProbeCronsAreDeterministicAndStaggered(t *testing.T) {
 	require.NotEqual(t, automatedGrokColdPoolCron(42), automatedGrokColdPoolCron(43))
 	require.Equal(t, automatedGrokActiveProbeCron(42), automatedGrokActiveProbeCron(42))
 	require.Contains(t, automatedGrokActiveProbeCron(42), ",")
+}
+
+func TestScheduledProbeRecoversActiveGrokSlowTTFTQuarantineOnlyWhenFast(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIScheduler.GrokSlowQuarantineTTFTMs = 20_000
+	runner := &ScheduledTestRunnerService{cfg: cfg, rateLimitSvc: &RateLimitService{}}
+	account := &Account{
+		ID:       44,
+		Platform: PlatformGrok,
+		Type:     AccountTypeOAuth,
+		Extra: map[string]any{
+			modelRateLimitsKey: map[string]any{
+				"grok-4.5": map[string]any{
+					"rate_limit_reset_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+					"reason":              "grok slow ttft quarantine: 25000ms (2 consecutive)",
+				},
+			},
+		},
+	}
+
+	require.True(t, runner.shouldRecoverGrokSlowTTFTFromProbe(account, &ScheduledTestResult{Status: "success", LatencyMs: 12_000}))
+	require.False(t, runner.shouldRecoverGrokSlowTTFTFromProbe(account, &ScheduledTestResult{Status: "success", LatencyMs: 25_000}))
+	require.False(t, runner.shouldRecoverGrokSlowTTFTFromProbe(account, &ScheduledTestResult{Status: "failed", LatencyMs: 1_000}))
 }

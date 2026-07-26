@@ -147,6 +147,14 @@ func (s *ScheduledTestRunnerService) runOnePlan(ctx context.Context, plan *Sched
 		if s.accountRepo != nil {
 			account, accountErr = s.accountRepo.GetByID(ctx, plan.AccountID)
 		}
+		if accountErr == nil && s.shouldRecoverGrokSlowTTFTFromProbe(account, result) {
+			recovered, recoverErr := s.rateLimitSvc.RecoverGrokSlowTTFTAfterFastProbe(ctx, plan.AccountID)
+			if recoverErr != nil {
+				logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d Grok slow-TTFT probe recovery failed: account=%d err=%v", plan.ID, plan.AccountID, recoverErr)
+			} else if recovered {
+				logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d cleared Grok slow-TTFT quarantine after fast probe: account=%d latency_ms=%d", plan.ID, plan.AccountID, result.LatencyMs)
+			}
+		}
 		if accountErr == nil && isAutomatedGrokQuarantined(account) {
 			s.tryPromoteQuarantinedAutomatedGrok(ctx, plan, result)
 		} else {
@@ -169,6 +177,15 @@ func (s *ScheduledTestRunnerService) runOnePlan(ctx context.Context, plan *Sched
 	if err := s.planRepo.UpdateAfterRun(ctx, plan.ID, time.Now(), nextRun); err != nil {
 		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d UpdateAfterRun error: %v", plan.ID, err)
 	}
+}
+
+func (s *ScheduledTestRunnerService) shouldRecoverGrokSlowTTFTFromProbe(account *Account, result *ScheduledTestResult) bool {
+	if s == nil || s.cfg == nil || s.rateLimitSvc == nil || account == nil || result == nil || result.Status != "success" {
+		return false
+	}
+	thresholdMs := s.cfg.Gateway.OpenAIScheduler.GrokSlowQuarantineTTFTMs
+	return thresholdMs > 0 && result.LatencyMs <= int64(thresholdMs) &&
+		isActiveGrokSlowTTFTModelRateLimit(account, time.Now())
 }
 
 func (s *ScheduledTestRunnerService) recordAutomatedGrokHealth(ctx context.Context, plan *ScheduledTestPlan, result *ScheduledTestResult) bool {
