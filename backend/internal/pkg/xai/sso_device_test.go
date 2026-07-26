@@ -4,6 +4,7 @@ package xai
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -92,6 +93,54 @@ func TestNormalizeSSOTokenAcceptsCookieHeader(t *testing.T) {
 	require.Equal(t, "token-1", NormalizeSSOToken("Cookie: foo=bar; sso=token-1; sso-rw=token-2"))
 	require.Equal(t, "token-2", NormalizeSSOToken("sso-rw=token-2; foo=bar"))
 	require.Equal(t, "raw-token", NormalizeSSOToken(" raw-token ; ignored=1"))
+}
+
+type ssoTokenResponseClient struct {
+	status int
+	body   string
+}
+
+func (c ssoTokenResponseClient) Do(*http.Request) (*http.Response, error) {
+	return ssoDeviceResponse(c.status, nil, c.body), nil
+}
+
+func TestPollTokenPreservesStructuredOAuthErrors(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		body          string
+		wantCode      string
+		wantDesc      string
+		wantDenied    bool
+		wantCauseText string
+	}{
+		{name: "access denied", status: http.StatusForbidden, body: `{"error":"access_denied","error_description":"account is not eligible"}`, wantCode: "access_denied", wantDesc: "account is not eligible", wantDenied: true},
+		{name: "expired token", status: http.StatusBadRequest, body: `{"error":"expired_token","error_description":"device code expired"}`, wantCode: "expired_token", wantDesc: "device code expired", wantDenied: true},
+		{name: "invalid grant", status: http.StatusBadRequest, body: `{"error":"invalid_grant","error_description":"Access denied"}`, wantCode: "invalid_grant", wantDesc: "Access denied"},
+		{name: "malformed response", status: http.StatusBadGateway, body: `<html>upstream failure</html>`, wantCauseText: "parse xAI token response"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			flow := &ssoDeviceFlow{
+				client: ssoTokenResponseClient{status: tt.status, body: tt.body},
+				sleep:  func(context.Context, time.Duration) error { return nil },
+			}
+			_, err := flow.pollToken(context.Background(), "device-code", time.Second, time.Minute)
+			require.Error(t, err)
+
+			var tokenErr SSOTokenError
+			require.ErrorAs(t, err, &tokenErr)
+			require.Equal(t, tt.status, tokenErr.Status)
+			require.Equal(t, tt.wantCode, tokenErr.Code)
+			require.Equal(t, tt.wantDesc, tokenErr.Description)
+			require.Equal(t, tt.wantDenied, errors.Is(err, ErrSSOAuthorizationDenied))
+			if tt.wantCauseText != "" {
+				require.ErrorContains(t, tokenErr.Cause, tt.wantCauseText)
+				require.NotContains(t, err.Error(), tt.body)
+			}
+		})
+	}
 }
 
 func ssoDeviceResponse(status int, header http.Header, body string) *http.Response {

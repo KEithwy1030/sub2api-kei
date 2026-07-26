@@ -2456,6 +2456,37 @@ func TestHandleGrokAccountUpstreamError429UsesFallbackReset(t *testing.T) {
 	require.Zero(t, repo.tempUnschedCalls)
 }
 
+func TestHandleGrokAccountUpstreamErrorQuarantinesFreeUsageExhaustion(t *testing.T) {
+	account := managedGrokHealthTestAccount()
+	account.ID = 633
+	repo := &grokQuotaAccountRepo{}
+	svc := &OpenAIGatewayService{accountRepo: repo}
+	before := time.Now()
+	body := []byte(`{"code":"subscription:free-usage-exhausted","error":"Usage resets over a rolling 24-hour window"}`)
+
+	svc.handleGrokAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, nil, body)
+
+	require.Equal(t, 2, repo.rateLimitedCalls, "the long free-usage block must extend the generic 429 fallback")
+	require.WithinDuration(t, before.Add(automatedGrokFreeUsageSafetyCooldown), repo.lastRateLimitResetAt, time.Second)
+	require.Equal(t, automatedGrokHealthUnhealthy, repo.updates[account.ID][automatedGrokHealthStateKey])
+	require.Equal(t, string(automatedGrokFailureFreeUsageExhausted), repo.updates[account.ID][automatedGrokHealthFailureClassKey])
+}
+
+func TestHandleGrokAccountUpstreamErrorQuarantinesPermanentPermissionDenial(t *testing.T) {
+	account := managedGrokHealthTestAccount()
+	account.ID = 634
+	repo := &grokQuotaAccountRepo{}
+	svc := &OpenAIGatewayService{accountRepo: repo}
+	body := []byte(`{"code":"permission-denied","error":"Access to the chat endpoint is denied. Please ensure you're using the correct credentials. If you believe this is a mistake, please contact support."}`)
+
+	svc.handleGrokAccountUpstreamError(context.Background(), account, http.StatusForbidden, nil, body)
+
+	require.Equal(t, 1, repo.tempUnschedCalls)
+	require.Equal(t, 1, repo.rateLimitedCalls)
+	require.Equal(t, automatedGrokHealthUnhealthy, repo.updates[account.ID][automatedGrokHealthStateKey])
+	require.Equal(t, string(automatedGrokFailurePermissionDenied), repo.updates[account.ID][automatedGrokHealthFailureClassKey])
+}
+
 func TestGrokRateLimitResetAtForAccountEscalatesRepeated429s(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	retryAfter := 45

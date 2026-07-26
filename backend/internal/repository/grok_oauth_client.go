@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -131,6 +132,38 @@ func createGrokSSOHTTPClient(proxyURL string) (*http.Client, error) {
 func grokSSOConversionError(err error) error {
 	if errors.Is(err, xai.ErrSSOUnauthorized) {
 		return infraerrors.New(http.StatusUnauthorized, "GROK_SSO_UNAUTHORIZED", "Grok Web SSO cookie is invalid or expired")
+	}
+	var tokenErr xai.SSOTokenError
+	if errors.As(err, &tokenErr) {
+		code := strings.TrimSpace(tokenErr.Code)
+		if code == "" {
+			code = "unknown"
+		}
+		description := logredact.RedactText(tokenErr.Description, "sso", "sso-rw", "device_code", "user_code")
+		if description == "" {
+			description = "none"
+		}
+		statusCode := http.StatusBadGateway
+		errorCode := "GROK_SSO_TOKEN_FAILED"
+		if errors.Is(tokenErr, xai.ErrSSOAuthorizationDenied) {
+			statusCode = http.StatusForbidden
+			errorCode = "GROK_SSO_AUTHORIZATION_DENIED"
+		}
+		metadata := map[string]string{
+			"oauth_code":      code,
+			"upstream_status": strconv.Itoa(tokenErr.Status),
+		}
+		if description != "none" {
+			metadata["oauth_description"] = description
+		}
+		return infraerrors.Newf(
+			statusCode,
+			errorCode,
+			"xAI token endpoint failed: upstream_status=%d oauth_code=%s description=%s",
+			tokenErr.Status,
+			code,
+			description,
+		).WithMetadata(metadata)
 	}
 	if errors.Is(err, xai.ErrSSOAuthorizationDenied) {
 		return infraerrors.New(http.StatusForbidden, "GROK_SSO_AUTHORIZATION_DENIED", "xAI device authorization was denied or expired")

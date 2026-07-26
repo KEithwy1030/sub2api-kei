@@ -187,6 +187,160 @@ func (s *AccountRepoSuite) TestUpdate() {
 	s.Require().Equal("updated", got.Name)
 }
 
+func (s *AccountRepoSuite) TestUpdateAutomatedGrokHealthIfNewerRejectsStaleObservation() {
+	now := time.Now().UTC().Truncate(time.Second)
+	account := mustCreateAccount(s.T(), s.client, &service.Account{
+		Name:     "grok-health-cas",
+		Platform: service.PlatformGrok,
+		Type:     service.AccountTypeOAuth,
+		Extra: map[string]any{
+			"automation_source":             "mac-grok-register",
+			"automation_cleanup_policy":     "grok-free-permanent-v1",
+			"automation_health_observed_at": now.Format(time.RFC3339Nano),
+			"automation_health_state":       "healthy",
+		},
+	})
+
+	applied, err := s.repo.UpdateAutomatedGrokHealthIfNewer(s.ctx, account.ID, now.Add(-time.Minute), map[string]any{
+		"automation_health_observed_at": now.Add(-time.Minute).Format(time.RFC3339Nano),
+		"automation_health_state":       "unhealthy",
+	})
+	s.Require().NoError(err)
+	s.Require().False(applied)
+	applied, err = s.repo.UpdateAutomatedGrokHealthIfNewer(s.ctx, account.ID, now, map[string]any{
+		"automation_health_observed_at": now.Format(time.RFC3339Nano),
+		"automation_health_state":       "unhealthy",
+	})
+	s.Require().NoError(err)
+	s.Require().False(applied)
+
+	applied, err = s.repo.UpdateAutomatedGrokHealthIfNewer(s.ctx, account.ID, now.Add(time.Minute), map[string]any{
+		"automation_health_observed_at": now.Add(time.Minute).Format(time.RFC3339Nano),
+		"automation_health_state":       "unhealthy",
+	})
+	s.Require().NoError(err)
+	s.Require().True(applied)
+
+	got, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().Equal("unhealthy", got.Extra["automation_health_state"])
+}
+
+func (s *AccountRepoSuite) TestQuarantineAutomatedGrokIfUnchangedProtectsConcurrentReauthorization() {
+	account := mustCreateAccount(s.T(), s.client, &service.Account{
+		Name:        "grok-retirement-cas",
+		Platform:    service.PlatformGrok,
+		Type:        service.AccountTypeOAuth,
+		Status:      service.StatusError,
+		Credentials: map[string]any{"refresh_token": "revoked"},
+		Extra: map[string]any{
+			"automation_source":         "mac-grok-register",
+			"automation_cleanup_policy": "grok-free-permanent-v1",
+		},
+	})
+	stale, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+
+	account.Name = "reauthorized"
+	account.Status = service.StatusActive
+	account.Credentials = map[string]any{"refresh_token": "rotated"}
+	s.Require().NoError(s.repo.Update(s.ctx, account))
+
+	quarantined, err := s.repo.QuarantineAutomatedGrokIfUnchanged(s.ctx, stale.ID, stale.UpdatedAt, stale.Credentials, time.Time{}, "", "credential_unrecoverable", "7 3 * * *")
+	s.Require().NoError(err)
+	s.Require().False(quarantined)
+
+	latest, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	quarantined, err = s.repo.QuarantineAutomatedGrokIfUnchanged(s.ctx, latest.ID, latest.UpdatedAt, latest.Credentials, time.Time{}, "", "credential_unrecoverable", "7 3 * * *")
+	s.Require().NoError(err)
+	s.Require().True(quarantined)
+	exists, err := s.repo.ExistsByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().True(exists)
+	cold, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(service.StatusError, cold.Status)
+	s.Require().False(cold.Schedulable)
+	s.Require().Equal("cold", cold.Extra["automation_quarantine_state"])
+	s.Require().Equal("rotated", cold.Credentials["refresh_token"])
+}
+
+func (s *AccountRepoSuite) TestQuarantineAutomatedGrokIfUnchangedProtectsNewerHealthObservation() {
+	observedAt := time.Now().UTC().Truncate(time.Second)
+	account := mustCreateAccount(s.T(), s.client, &service.Account{
+		Name:        "grok-retirement-health-cas",
+		Platform:    service.PlatformGrok,
+		Type:        service.AccountTypeOAuth,
+		Status:      service.StatusActive,
+		Credentials: map[string]any{"refresh_token": "current"},
+		Extra: map[string]any{
+			"automation_source":             "mac-grok-register",
+			"automation_cleanup_policy":     "grok-free-permanent-v1",
+			"automation_health_observed_at": observedAt.Format(time.RFC3339Nano),
+			"automation_health_state":       "healthy",
+		},
+	})
+	latest, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+
+	quarantined, err := s.repo.QuarantineAutomatedGrokIfUnchanged(
+		s.ctx,
+		latest.ID,
+		latest.UpdatedAt,
+		latest.Credentials,
+		observedAt.Add(-time.Minute),
+		"permission_denied",
+		"permission_denied",
+		"7 3 * * *",
+	)
+	s.Require().NoError(err)
+	s.Require().False(quarantined)
+	exists, err := s.repo.ExistsByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().True(exists)
+}
+
+func (s *AccountRepoSuite) TestPromoteAutomatedGrokIfUnchangedRequiresMatchingHealthyObservation() {
+	observedAt := time.Now().UTC().Truncate(time.Second)
+	account := mustCreateAccount(s.T(), s.client, &service.Account{
+		Name:        "grok-cold-promotion-cas",
+		Platform:    service.PlatformGrok,
+		Type:        service.AccountTypeOAuth,
+		Status:      service.StatusError,
+		Schedulable: false,
+		Credentials: map[string]any{"refresh_token": "current"},
+		Extra: map[string]any{
+			"automation_source":             "mac-grok-register",
+			"automation_cleanup_policy":     "grok-free-permanent-v1",
+			"automation_quarantine_state":   "cold",
+			"automation_health_state":       "healthy",
+			"automation_health_observed_at": observedAt.Format(time.RFC3339Nano),
+		},
+	})
+	latest, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+
+	promoted, err := s.repo.PromoteAutomatedGrokIfUnchanged(
+		s.ctx, latest.ID, latest.UpdatedAt, latest.Credentials, observedAt.Add(-time.Minute), "7 1,7,13,19 * * *",
+	)
+	s.Require().NoError(err)
+	s.Require().False(promoted)
+
+	promoted, err = s.repo.PromoteAutomatedGrokIfUnchanged(
+		s.ctx, latest.ID, latest.UpdatedAt, latest.Credentials, observedAt, "7 1,7,13,19 * * *",
+	)
+	s.Require().NoError(err)
+	s.Require().True(promoted)
+	active, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(service.StatusActive, active.Status)
+	s.Require().True(active.Schedulable)
+	s.Require().Empty(active.ErrorMessage)
+	s.Require().Nil(active.Extra["automation_quarantine_state"])
+	s.Require().Equal("current", active.Credentials["refresh_token"])
+}
+
 func (s *AccountRepoSuite) TestUpdate_SyncSchedulerSnapshotOnDisabled() {
 	account := mustCreateAccount(s.T(), s.client, &service.Account{Name: "sync-update", Status: service.StatusActive, Schedulable: true})
 	cacheRecorder := &schedulerCacheRecorder{}

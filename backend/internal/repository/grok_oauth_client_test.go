@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/stretchr/testify/require"
 )
@@ -118,4 +119,39 @@ func TestGrokOAuthEntitlementDenialRequiresExplicitEvidence(t *testing.T) {
 	require.True(t, grokOAuthHasExplicitEntitlementDenial(`{"message":"no active Grok subscription"}`))
 	require.False(t, grokOAuthHasExplicitEntitlementDenial(`{"error":"forbidden","message":"request forbidden"}`))
 	require.False(t, grokOAuthHasExplicitEntitlementDenial(`<html>403 Forbidden</html>`))
+}
+
+func TestGrokSSOConversionErrorIncludesCodeAndRedactsDescription(t *testing.T) {
+	err := grokSSOConversionError(xai.SSOTokenError{
+		Status:      http.StatusBadRequest,
+		Code:        "invalid_grant",
+		Description: "Access denied; access_token=access-secret; sso=sso-secret",
+	})
+
+	errText := err.Error()
+	require.Contains(t, errText, "GROK_SSO_TOKEN_FAILED")
+	require.Contains(t, errText, "upstream_status=400")
+	require.Contains(t, errText, "oauth_code=invalid_grant")
+	require.Contains(t, errText, "access_token=***")
+	require.Contains(t, errText, "sso=***")
+	require.NotContains(t, errText, "access-secret")
+	require.NotContains(t, errText, "sso-secret")
+	require.Equal(t, "invalid_grant", infraerrors.FromError(err).Metadata["oauth_code"])
+	require.Equal(t, "400", infraerrors.FromError(err).Metadata["upstream_status"])
+	require.NotContains(t, infraerrors.FromError(err).Metadata["oauth_description"], "access-secret")
+	require.NotContains(t, infraerrors.FromError(err).Metadata["oauth_description"], "sso-secret")
+}
+
+func TestGrokSSOConversionErrorPreservesDeniedOAuthCode(t *testing.T) {
+	err := grokSSOConversionError(xai.SSOTokenError{
+		Status:      http.StatusForbidden,
+		Code:        "access_denied",
+		Description: "account is not eligible",
+		Cause:       xai.ErrSSOAuthorizationDenied,
+	})
+
+	errText := err.Error()
+	require.Contains(t, errText, "GROK_SSO_AUTHORIZATION_DENIED")
+	require.Contains(t, errText, "oauth_code=access_denied")
+	require.Contains(t, errText, "description=account is not eligible")
 }

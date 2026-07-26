@@ -717,6 +717,208 @@ func (r *accountRepository) Delete(ctx context.Context, id int64) error {
 	return nil
 }
 
+// QuarantineAutomatedGrokIfUnchanged isolates an automated account while
+// retaining its credentials, groups, history, and low-frequency test plan.
+func (r *accountRepository) QuarantineAutomatedGrokIfUnchanged(
+	ctx context.Context,
+	id int64,
+	expectedUpdatedAt time.Time,
+	expectedCredentials map[string]any,
+	expectedHealthObservedAt time.Time,
+	expectedFailureClass string,
+	reason string,
+	coldCron string,
+) (bool, error) {
+	credentialsJSON, err := json.Marshal(expectedCredentials)
+	if err != nil {
+		return false, err
+	}
+	quarantinedAt := time.Now().UTC()
+	extraJSON, err := json.Marshal(map[string]any{
+		"automation_quarantine_state":  "cold",
+		"automation_quarantine_reason": strings.TrimSpace(reason),
+		"automation_quarantined_at":    quarantinedAt.Format(time.RFC3339),
+		"cold_restore_state":           nil,
+	})
+	if err != nil {
+		return false, err
+	}
+	tx, err := r.client.Tx(ctx)
+	if err != nil && !errors.Is(err, dbent.ErrTxStarted) {
+		return false, err
+	}
+	var txClient *dbent.Client
+	if tx != nil {
+		defer func() { _ = tx.Rollback() }()
+		txClient = tx.Client()
+	} else {
+		txClient = r.client
+	}
+
+	lockedRows, err := txClient.QueryContext(ctx, `
+		SELECT id
+		FROM accounts
+		WHERE id = $1
+		  AND deleted_at IS NULL
+		  AND platform = 'grok'
+		  AND type = 'oauth'
+		  AND updated_at = $2
+		  AND credentials = $3::jsonb
+		  AND status <> 'disabled'
+		  AND COALESCE(extra->>'automation_source', '') = 'mac-grok-register'
+		  AND COALESCE(extra->>'automation_cleanup_policy', '') = 'grok-free-permanent-v1'
+		  AND COALESCE(extra->>'automation_quarantine_state', '') <> 'cold'
+		  AND (
+		        $4 = ''
+		        OR (
+		          COALESCE(extra->>'automation_health_failure_class', '') = $4
+		          AND NULLIF(extra->>'automation_health_observed_at', '')::timestamptz = $5
+		        )
+		      )
+		FOR UPDATE
+	`, id, expectedUpdatedAt, string(credentialsJSON), expectedFailureClass, expectedHealthObservedAt.UTC())
+	if err != nil {
+		return false, err
+	}
+	if !lockedRows.Next() {
+		if err := lockedRows.Close(); err != nil {
+			return false, err
+		}
+		return false, lockedRows.Err()
+	}
+	var lockedID int64
+	if err := lockedRows.Scan(&lockedID); err != nil {
+		_ = lockedRows.Close()
+		return false, err
+	}
+	if err := lockedRows.Close(); err != nil {
+		return false, err
+	}
+
+	result, err := txClient.ExecContext(ctx, `
+		UPDATE accounts
+		SET status = $2,
+		    schedulable = FALSE,
+		    error_message = COALESCE(NULLIF(error_message, ''), 'Automated Grok cold-pool quarantine: ' || $3),
+		    extra = COALESCE(extra, '{}'::jsonb) || $4::jsonb,
+		    updated_at = NOW()
+		WHERE id = $1
+	`, id, service.StatusError, strings.TrimSpace(reason), string(extraJSON))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected != 1 {
+		return false, nil
+	}
+	if _, err := txClient.ExecContext(ctx, `
+		UPDATE scheduled_test_plans
+		SET cron_expression = $2, enabled = TRUE, auto_recover = TRUE, updated_at = NOW()
+		WHERE account_id = $1
+	`, id, coldCron); err != nil {
+		return false, err
+	}
+	if err := enqueueSchedulerOutbox(ctx, txClient, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		return false, err
+	}
+	if tx != nil {
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		r.syncSchedulerAccountSnapshot(ctx, id)
+	}
+	return true, nil
+}
+
+// PromoteAutomatedGrokIfUnchanged returns a cold-pool account to production
+// only when the successful health observation still matches the locked row.
+func (r *accountRepository) PromoteAutomatedGrokIfUnchanged(
+	ctx context.Context,
+	id int64,
+	expectedUpdatedAt time.Time,
+	expectedCredentials map[string]any,
+	expectedHealthObservedAt time.Time,
+	activeCron string,
+) (bool, error) {
+	credentialsJSON, err := json.Marshal(expectedCredentials)
+	if err != nil {
+		return false, err
+	}
+	extraJSON, err := json.Marshal(map[string]any{
+		"automation_quarantine_state":  nil,
+		"automation_quarantine_reason": nil,
+		"automation_quarantined_at":    nil,
+		"automation_promoted_at":       time.Now().UTC().Format(time.RFC3339),
+		"cold_restore_state":           nil,
+	})
+	if err != nil {
+		return false, err
+	}
+	tx, err := r.client.Tx(ctx)
+	if err != nil && !errors.Is(err, dbent.ErrTxStarted) {
+		return false, err
+	}
+	var txClient *dbent.Client
+	if tx != nil {
+		defer func() { _ = tx.Rollback() }()
+		txClient = tx.Client()
+	} else {
+		txClient = r.client
+	}
+
+	result, err := txClient.ExecContext(ctx, `
+		UPDATE accounts
+		SET status = $2,
+		    schedulable = TRUE,
+		    error_message = '',
+		    extra = COALESCE(extra, '{}'::jsonb) || $3::jsonb,
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND deleted_at IS NULL
+		  AND platform = 'grok'
+		  AND type = 'oauth'
+		  AND status = $4
+		  AND schedulable = FALSE
+		  AND updated_at = $5
+		  AND credentials = $6::jsonb
+		  AND COALESCE(extra->>'automation_source', '') = 'mac-grok-register'
+		  AND COALESCE(extra->>'automation_cleanup_policy', '') = 'grok-free-permanent-v1'
+		  AND COALESCE(extra->>'automation_quarantine_state', '') = 'cold'
+		  AND COALESCE(extra->>'automation_health_state', '') = 'healthy'
+		  AND NULLIF(extra->>'automation_health_observed_at', '')::timestamptz = $7
+	`, id, service.StatusActive, string(extraJSON), service.StatusError, expectedUpdatedAt, string(credentialsJSON), expectedHealthObservedAt.UTC())
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected != 1 {
+		return false, nil
+	}
+	if _, err := txClient.ExecContext(ctx, `
+		UPDATE scheduled_test_plans
+		SET cron_expression = $2, enabled = TRUE, auto_recover = TRUE, updated_at = NOW()
+		WHERE account_id = $1
+	`, id, activeCron); err != nil {
+		return false, err
+	}
+	if err := enqueueSchedulerOutbox(ctx, txClient, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		return false, err
+	}
+	if tx != nil {
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		r.syncSchedulerAccountSnapshot(ctx, id)
+	}
+	return true, nil
+}
+
 func (r *accountRepository) List(ctx context.Context, params pagination.PaginationParams) ([]service.Account, *pagination.PaginationResult, error) {
 	return r.ListWithFilters(ctx, params, "", "", "", "", 0, "")
 }
@@ -2551,6 +2753,73 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 		}
 	}
 	return nil
+}
+
+// UpdateAutomatedGrokHealthIfNewer prevents a delayed scheduled-test result
+// from overwriting a newer runtime or probe observation.
+func (r *accountRepository) UpdateAutomatedGrokHealthIfNewer(
+	ctx context.Context,
+	id int64,
+	observedAt time.Time,
+	updates map[string]any,
+) (bool, error) {
+	if len(updates) == 0 {
+		return false, nil
+	}
+	payload, err := json.Marshal(updates)
+	if err != nil {
+		return false, err
+	}
+
+	baseCtx := ctx
+	contextTx := dbent.TxFromContext(ctx)
+	client := clientFromContext(ctx, r.client)
+	var tx *dbent.Tx
+	if contextTx == nil {
+		tx, err = r.client.Tx(ctx)
+		if err != nil && !errors.Is(err, dbent.ErrTxStarted) {
+			return false, err
+		}
+		if tx != nil {
+			defer func() { _ = tx.Rollback() }()
+			ctx = dbent.NewTxContext(ctx, tx)
+			client = tx.Client()
+		}
+	}
+
+	result, err := client.ExecContext(ctx, `
+		UPDATE accounts
+		SET extra = COALESCE(extra, '{}'::jsonb) || $1::jsonb,
+		    updated_at = NOW()
+		WHERE id = $2
+		  AND deleted_at IS NULL
+		  AND COALESCE(
+		        NULLIF(extra->>'automation_health_observed_at', '')::timestamptz,
+		        '-infinity'::timestamptz
+		      ) < $3
+	`, string(payload), id, observedAt.UTC())
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		return false, err
+	}
+	if tx != nil {
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+	}
+	if contextTx == nil {
+		r.syncSchedulerAccountSnapshot(baseCtx, id)
+	}
+	return true, nil
 }
 
 // UpdateUpstreamBillingProbeSnapshot stores a probe result only while the

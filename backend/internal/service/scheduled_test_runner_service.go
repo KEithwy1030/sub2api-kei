@@ -135,13 +135,29 @@ func (s *ScheduledTestRunnerService) runOnePlan(ctx context.Context, plan *Sched
 		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d SaveResult error: %v", plan.ID, err)
 	}
 
-	if resultSaved && s.tryRetirePermanentlyUnavailableAutomatedGrok(ctx, plan, result) {
-		return
+	healthApplied := false
+	if resultSaved {
+		healthApplied = s.recordAutomatedGrokHealth(ctx, plan, result)
+	}
+	// Cold-pool accounts need stable recovery evidence before they re-enter the
+	// production scheduler. Other accounts retain the existing one-shot recovery.
+	if result.Status == "success" && plan.AutoRecover {
+		var account *Account
+		var accountErr error
+		if s.accountRepo != nil {
+			account, accountErr = s.accountRepo.GetByID(ctx, plan.AccountID)
+		}
+		if accountErr == nil && isAutomatedGrokQuarantined(account) {
+			s.tryPromoteQuarantinedAutomatedGrok(ctx, plan, result)
+		} else {
+			s.tryRecoverAccount(ctx, plan.AccountID, plan.ID)
+		}
 	}
 
-	// Auto-recover account if test succeeded and auto_recover is enabled.
-	if result.Status == "success" && plan.AutoRecover {
-		s.tryRecoverAccount(ctx, plan.AccountID, plan.ID)
+	// Retirement re-reads the account after recovery, so a successful probe can
+	// clear stale invalid_grant state before an isolation decision.
+	if resultSaved && healthApplied {
+		s.tryRetirePermanentlyUnavailableAutomatedGrok(ctx, plan, result)
 	}
 
 	nextRun, err := computeNextRun(plan.CronExpression, time.Now())
@@ -153,6 +169,33 @@ func (s *ScheduledTestRunnerService) runOnePlan(ctx context.Context, plan *Sched
 	if err := s.planRepo.UpdateAfterRun(ctx, plan.ID, time.Now(), nextRun); err != nil {
 		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d UpdateAfterRun error: %v", plan.ID, err)
 	}
+}
+
+func (s *ScheduledTestRunnerService) recordAutomatedGrokHealth(ctx context.Context, plan *ScheduledTestPlan, result *ScheduledTestResult) bool {
+	if s == nil || s.accountRepo == nil || plan == nil || result == nil {
+		return false
+	}
+	account, err := s.accountRepo.GetByID(ctx, plan.AccountID)
+	if err != nil || !automatedGrokHealthManaged(account) {
+		return false
+	}
+
+	observedAt := result.FinishedAt
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+	var updates map[string]any
+	if result.Status == "success" {
+		updates = automatedGrokHealthSuccessUpdates(observedAt)
+	} else {
+		updates = automatedGrokHealthFailureUpdates(classifyAutomatedGrokScheduledFailure(result.ErrorMessage), observedAt)
+	}
+	applied, err := persistAutomatedGrokHealthUpdates(ctx, s.accountRepo, account, observedAt, updates)
+	if err != nil {
+		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d Grok health snapshot update failed: %v", plan.ID, err)
+		return false
+	}
+	return applied
 }
 
 // tryRecoverAccount attempts to recover an account from recoverable runtime state.

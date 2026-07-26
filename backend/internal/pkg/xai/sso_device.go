@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -37,6 +36,28 @@ var (
 type SSOHTTPError struct{ Status int }
 
 func (e SSOHTTPError) Error() string { return fmt.Sprintf("xAI OAuth HTTP %d", e.Status) }
+
+// SSOTokenError preserves the structured OAuth error without retaining the
+// response body, which may contain credentials.
+type SSOTokenError struct {
+	Status      int
+	Code        string
+	Description string
+	Cause       error
+}
+
+func (e SSOTokenError) Error() string {
+	code := strings.TrimSpace(e.Code)
+	if code == "" {
+		code = "unknown"
+	}
+	if e.Status > 0 {
+		return fmt.Sprintf("xAI token endpoint HTTP %d (%s)", e.Status, code)
+	}
+	return fmt.Sprintf("xAI token endpoint error (%s)", code)
+}
+
+func (e SSOTokenError) Unwrap() error { return e.Cause }
 
 type SSODeviceHTTPClient interface {
 	Do(*http.Request) (*http.Response, error)
@@ -198,7 +219,10 @@ func (f *ssoDeviceFlow) pollToken(ctx context.Context, deviceCode string, interv
 			ErrorDescription string `json:"error_description"`
 		}
 		if err := json.Unmarshal(body, &payload); err != nil {
-			return nil, fmt.Errorf("parse xAI token response: %w", err)
+			return nil, SSOTokenError{
+				Status: status,
+				Cause:  fmt.Errorf("parse xAI token response: %w", err),
+			}
 		}
 		if status >= 200 && status < 300 && payload.AccessToken != "" {
 			if payload.ExpiresIn <= 0 {
@@ -223,12 +247,18 @@ func (f *ssoDeviceFlow) pollToken(ctx context.Context, deviceCode string, interv
 			interval += 5 * time.Second
 			continue
 		case "access_denied", "expired_token":
-			return nil, ErrSSOAuthorizationDenied
-		default:
-			if status >= 400 {
-				return nil, fmt.Errorf("xAI token polling failed (%s): %w", firstNonEmpty(payload.ErrorDescription, payload.Error), SSOHTTPError{Status: status})
+			return nil, SSOTokenError{
+				Status:      status,
+				Code:        payload.Error,
+				Description: payload.ErrorDescription,
+				Cause:       ErrSSOAuthorizationDenied,
 			}
-			return nil, fmt.Errorf("xAI token polling failed: %s", firstNonEmpty(payload.ErrorDescription, payload.Error, strconv.Itoa(status)))
+		default:
+			return nil, SSOTokenError{
+				Status:      status,
+				Code:        payload.Error,
+				Description: payload.ErrorDescription,
+			}
 		}
 	}
 	return nil, errors.New("xAI device flow token polling timed out")

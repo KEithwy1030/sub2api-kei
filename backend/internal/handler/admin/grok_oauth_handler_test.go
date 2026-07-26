@@ -3,8 +3,10 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -274,6 +277,38 @@ func TestGrokSSOImportWorkerRecoversPanic(t *testing.T) {
 	require.False(t, result.created)
 	require.Equal(t, 2, result.item.Index)
 	require.Contains(t, result.item.Error, "internal worker panic")
+}
+
+func TestGrokSSOImportFailureIsStructuredAndLogSafe(t *testing.T) {
+	err := infraerrors.New(
+		http.StatusForbidden,
+		"GROK_SSO_AUTHORIZATION_DENIED",
+		"xAI token endpoint failed: oauth_code=access_denied description=account is not eligible",
+	).WithMetadata(map[string]string{
+		"oauth_code":        "access_denied",
+		"upstream_status":   "403",
+		"oauth_description": "account is not eligible",
+	})
+
+	item := grokSSOImportFailureItem(7, err)
+	require.Equal(t, 7, item.Index)
+	require.Equal(t, "GROK_SSO_AUTHORIZATION_DENIED", item.Reason)
+	require.Equal(t, "access_denied", item.OAuthCode)
+	require.Equal(t, "403", item.UpstreamStatus)
+
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(previousLogger)
+	proxyID := int64(7)
+	logGrokSSOImportConversionFailure(7, &proxyID, err)
+
+	require.Contains(t, logs.String(), "grok_sso_import_conversion_failed")
+	require.Contains(t, logs.String(), "oauth_code=access_denied")
+	require.Contains(t, logs.String(), "upstream_status=403")
+	require.Contains(t, logs.String(), "proxy_id=7")
+	require.NotContains(t, logs.String(), "sso=")
+	require.NotContains(t, logs.String(), "token=")
 }
 
 func TestGrokOAuthHandlerReconcileDefaultsToDryRun(t *testing.T) {

@@ -33,7 +33,7 @@ func TestIsPermanentGrokScheduledTestFailureIsStrict(t *testing.T) {
 	}
 }
 
-func TestHasStablePermanentGrokFailuresRequiresThreeAcrossElevenHours(t *testing.T) {
+func TestHasStablePermanentGrokFailuresRequiresThreeAcrossTwentyFourHours(t *testing.T) {
 	now := time.Now()
 	makeResult := func(hoursAgo int, status, message string) *ScheduledTestResult {
 		started := now.Add(-time.Duration(hoursAgo) * time.Hour)
@@ -41,37 +41,98 @@ func TestHasStablePermanentGrokFailuresRequiresThreeAcrossElevenHours(t *testing
 	}
 	stable := []*ScheduledTestResult{
 		makeResult(0, "failed", permanentGrokTestError()),
-		makeResult(6, "failed", permanentGrokTestError()),
 		makeResult(12, "failed", permanentGrokTestError()),
+		makeResult(24, "failed", permanentGrokTestError()),
 	}
 	require.True(t, hasStablePermanentGrokFailures(stable))
 	require.False(t, hasStablePermanentGrokFailures(stable[:2]))
 
 	withSuccess := append([]*ScheduledTestResult(nil), stable...)
-	withSuccess[1] = makeResult(6, "success", "")
+	withSuccess[1] = makeResult(12, "success", "")
 	require.False(t, hasStablePermanentGrokFailures(withSuccess))
 
 	shortSpan := append([]*ScheduledTestResult(nil), stable...)
-	shortSpan[2] = makeResult(10, "failed", permanentGrokTestError())
+	shortSpan[2] = makeResult(23, "failed", permanentGrokTestError())
 	require.False(t, hasStablePermanentGrokFailures(shortSpan))
 }
 
-func TestAutomatedGrokCleanupRequiresExplicitPolicyAndGrace(t *testing.T) {
+func TestAutomatedGrokCleanupRequiresExplicitActivePolicy(t *testing.T) {
 	now := time.Now().UTC()
 	account := &Account{
-		Platform: PlatformGrok,
-		Type:     AccountTypeOAuth,
+		Platform:  PlatformGrok,
+		Type:      AccountTypeOAuth,
+		CreatedAt: now.Add(-25 * time.Hour),
 		Extra: map[string]any{
 			automatedGrokCleanupSourceKey:    automatedGrokCleanupSourceValue,
 			automatedGrokCleanupPolicyKey:    automatedGrokCleanupPolicyValue,
-			automatedGrokCleanupEnabledAtKey: now.Add(-25 * time.Hour).Format(time.RFC3339),
+			automatedGrokCleanupEnabledAtKey: now.Add(-time.Minute).Format(time.RFC3339),
 		},
 	}
 	require.True(t, automatedGrokCleanupEnabled(account, now))
 
-	account.Extra[automatedGrokCleanupEnabledAtKey] = now.Add(-23 * time.Hour).Format(time.RFC3339)
+	account.CreatedAt = now.Add(-23 * time.Hour)
 	require.False(t, automatedGrokCleanupEnabled(account, now))
-	account.Extra[automatedGrokCleanupEnabledAtKey] = now.Add(-25 * time.Hour).Format(time.RFC3339)
+	account.CreatedAt = now.Add(-25 * time.Hour)
+	account.Extra[automatedGrokCleanupEnabledAtKey] = now.Add(time.Minute).Format(time.RFC3339)
+	require.False(t, automatedGrokCleanupEnabled(account, now))
+	account.Extra[automatedGrokCleanupEnabledAtKey] = now.Add(-time.Minute).Format(time.RFC3339)
 	account.Extra[automatedGrokCleanupSourceKey] = "manual"
 	require.False(t, automatedGrokCleanupEnabled(account, now), fmt.Sprintf("unexpected cleanup eligibility: %#v", account.Extra))
+}
+
+func TestPermanentAutomatedGrokCredentialStateIsStrict(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  string
+		message string
+		want    bool
+	}{
+		{name: "revoked refresh token", status: StatusError, message: `Token refresh failed (non-retryable): status 400 invalid_grant refresh token has been revoked`, want: true},
+		{name: "missing refresh token", status: StatusError, message: "Grok OAuth credential reconciliation: missing refresh token", want: true},
+		{name: "oauth 401 without refresh", status: StatusError, message: "Authentication failed (401): refresh_token missing, cannot recover", want: true},
+		{name: "temporary refresh failure", status: StatusError, message: "Token refresh failed (non-retryable): provider timeout"},
+		{name: "proxy configuration", status: StatusError, message: "Grok OAuth account proxy configuration is invalid"},
+		{name: "active account", status: StatusActive, message: `Token refresh failed (non-retryable): invalid_grant`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, isPermanentAutomatedGrokCredentialState(&Account{Status: tt.status, ErrorMessage: tt.message}))
+		})
+	}
+}
+
+func TestShouldRetireAutomatedGrokDoesNotRequireLatestProbeFailureForPermanentCredentials(t *testing.T) {
+	account := &Account{
+		Status:       StatusError,
+		ErrorMessage: `Token refresh failed (non-retryable): status 400 invalid_grant refresh token has been revoked`,
+	}
+	recentSuccess := &ScheduledTestResult{Status: "success"}
+
+	require.True(t, shouldRetireAutomatedGrok(account, recentSuccess))
+	require.False(t, shouldRetireAutomatedGrok(&Account{Status: StatusActive}, recentSuccess))
+}
+
+func TestHasStableGrokRecoveryRequiresTwoSuccessesAcrossTwelveHours(t *testing.T) {
+	now := time.Now().UTC()
+	stable := []*ScheduledTestResult{
+		{Status: "success", StartedAt: now.Add(-time.Minute), FinishedAt: now},
+		{Status: "success", StartedAt: now.Add(-13 * time.Hour), FinishedAt: now.Add(-13*time.Hour + time.Minute)},
+	}
+	require.True(t, hasStableGrokRecovery(stable))
+	require.False(t, hasStableGrokRecovery(stable[:1]))
+
+	failed := append([]*ScheduledTestResult(nil), stable...)
+	failed[1] = &ScheduledTestResult{Status: "failed", StartedAt: now.Add(-13 * time.Hour), FinishedAt: now.Add(-13*time.Hour + time.Minute)}
+	require.False(t, hasStableGrokRecovery(failed))
+
+	tooClose := append([]*ScheduledTestResult(nil), stable...)
+	tooClose[1] = &ScheduledTestResult{Status: "success", StartedAt: now.Add(-11 * time.Hour), FinishedAt: now.Add(-11*time.Hour + time.Minute)}
+	require.False(t, hasStableGrokRecovery(tooClose))
+}
+
+func TestAutomatedGrokProbeCronsAreDeterministicAndStaggered(t *testing.T) {
+	require.Equal(t, automatedGrokColdPoolCron(42), automatedGrokColdPoolCron(42))
+	require.NotEqual(t, automatedGrokColdPoolCron(42), automatedGrokColdPoolCron(43))
+	require.Equal(t, automatedGrokActiveProbeCron(42), automatedGrokActiveProbeCron(42))
+	require.Contains(t, automatedGrokActiveProbeCron(42), ",")
 }

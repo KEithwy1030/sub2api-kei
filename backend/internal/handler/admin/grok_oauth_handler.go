@@ -281,11 +281,14 @@ type GrokSSOToOAuthRequest struct {
 }
 
 type GrokSSOToOAuthItemResult struct {
-	Index   int          `json:"index"`
-	Name    string       `json:"name,omitempty"`
-	Email   string       `json:"email,omitempty"`
-	Account *dto.Account `json:"account,omitempty"`
-	Error   string       `json:"error,omitempty"`
+	Index          int          `json:"index"`
+	Name           string       `json:"name,omitempty"`
+	Email          string       `json:"email,omitempty"`
+	Account        *dto.Account `json:"account,omitempty"`
+	Error          string       `json:"error,omitempty"`
+	Reason         string       `json:"reason,omitempty"`
+	OAuthCode      string       `json:"oauth_code,omitempty"`
+	UpstreamStatus string       `json:"upstream_status,omitempty"`
 }
 
 type GrokSSOToOAuthResponse struct {
@@ -370,7 +373,9 @@ func (h *GrokOAuthHandler) safeCreateAccountFromSSOToken(ctx context.Context, re
 func (h *GrokOAuthHandler) createAccountFromSSOToken(ctx context.Context, req GrokSSOToOAuthRequest, token string, index, total int) grokSSOImportWorkerResult {
 	tokenInfo, err := h.grokOAuthService.ConvertFromSSO(ctx, token, req.ProxyID)
 	if err != nil {
-		return grokSSOImportWorkerResult{item: GrokSSOToOAuthItemResult{Index: index, Error: grokSSOImportErrorMessage(err)}}
+		item := grokSSOImportFailureItem(index, err)
+		logGrokSSOImportConversionFailure(index, req.ProxyID, err)
+		return grokSSOImportWorkerResult{item: item}
 	}
 
 	credentials := grokSSOImportCredentials(h.grokOAuthService.BuildAccountCredentials(tokenInfo), req.Credentials)
@@ -505,6 +510,44 @@ func grokSSOImportErrorMessage(err error) string {
 		return status.Reason + ": " + status.Message
 	}
 	return status.Message
+}
+
+func grokSSOImportFailureItem(index int, err error) GrokSSOToOAuthItemResult {
+	status := infraerrors.FromError(err)
+	item := GrokSSOToOAuthItemResult{
+		Index:  index,
+		Error:  grokSSOImportErrorMessage(err),
+		Reason: status.Reason,
+	}
+	if status.Metadata != nil {
+		item.OAuthCode = status.Metadata["oauth_code"]
+		item.UpstreamStatus = status.Metadata["upstream_status"]
+	}
+	return item
+}
+
+func logGrokSSOImportConversionFailure(index int, proxyID *int64, err error) {
+	status := infraerrors.FromError(err)
+	attrs := []any{
+		"index", index,
+		"http_status", status.Code,
+		"reason", status.Reason,
+	}
+	if proxyID != nil {
+		attrs = append(attrs, "proxy_id", *proxyID)
+	}
+	if status.Metadata != nil {
+		if value := strings.TrimSpace(status.Metadata["upstream_status"]); value != "" {
+			attrs = append(attrs, "upstream_status", value)
+		}
+		if value := strings.TrimSpace(status.Metadata["oauth_code"]); value != "" {
+			attrs = append(attrs, "oauth_code", value)
+		}
+		if value := strings.TrimSpace(status.Metadata["oauth_description"]); value != "" {
+			attrs = append(attrs, "oauth_description", value)
+		}
+	}
+	slog.Warn("grok_sso_import_conversion_failed", attrs...)
 }
 
 func (h *GrokOAuthHandler) QueryQuota(c *gin.Context) {

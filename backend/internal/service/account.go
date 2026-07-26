@@ -167,6 +167,9 @@ func (a *Account) IsSchedulable() bool {
 		return false
 	}
 	now := time.Now()
+	if !automatedGrokHealthAllowsScheduling(a, now) {
+		return false
+	}
 	if a.AutoPauseOnExpired && a.ExpiresAt != nil && !now.Before(*a.ExpiresAt) {
 		return false
 	}

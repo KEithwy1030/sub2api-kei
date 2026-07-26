@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -791,6 +792,25 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		failureClass := automatedGrokFailureClass("")
+		switch {
+		case isGrokFreeUsageExhaustedResponse(resp.StatusCode, body):
+			failureClass = automatedGrokFailureFreeUsageExhausted
+		case isPermanentGrokPermissionDeniedResponse(resp.StatusCode, body):
+			failureClass = automatedGrokFailurePermissionDenied
+		}
+		if failureClass != "" && automatedGrokHealthManaged(account) {
+			if err := persistAutomatedGrokHealthFailure(
+				ctx,
+				s.accountRepo,
+				account,
+				failureClass,
+				now,
+			); err != nil {
+				slog.Warn("persist_grok_probe_automation_health_failed", "account_id", account.ID, "failure_class", failureClass, "error", err)
+			}
+			persistGrokRateLimit(ctx, s.accountRepo, account, now.Add(automatedGrokFreeUsageSafetyCooldown))
+		}
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Grok Responses API returned %d: %s", resp.StatusCode, string(body)))
 	}
 

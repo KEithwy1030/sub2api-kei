@@ -1297,14 +1297,37 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 		s.tempUnscheduleGrok(ctx, account, 30*time.Minute, "grok credits or subscription unavailable")
 	case http.StatusForbidden:
 		s.tempUnscheduleGrok(ctx, account, 30*time.Minute, "grok access or entitlement denied")
+		if isPermanentGrokPermissionDeniedResponse(statusCode, responseBody) {
+			s.quarantineAutomatedGrokHealth(ctx, account, automatedGrokFailurePermissionDenied, now)
+		}
 	case http.StatusTooManyRequests:
-		// updateGrokUsageSnapshot installs both runtime and durable rate-limit state.
+		if isGrokFreeUsageExhaustedResponse(statusCode, responseBody) {
+			s.quarantineAutomatedGrokHealth(ctx, account, automatedGrokFailureFreeUsageExhausted, now)
+		}
 	default:
 		if statusCode >= 500 {
 			s.tempUnscheduleGrok(ctx, account, 2*time.Minute, "grok upstream temporary error")
 		}
 	}
-	_ = responseBody
+}
+
+func (s *OpenAIGatewayService) quarantineAutomatedGrokHealth(
+	ctx context.Context,
+	account *Account,
+	class automatedGrokFailureClass,
+	observedAt time.Time,
+) {
+	if s == nil || !automatedGrokHealthManaged(account) {
+		return
+	}
+	stateCtx, cancel := openAIAccountStateContext(ctx)
+	defer cancel()
+	if err := persistAutomatedGrokHealthFailure(stateCtx, s.accountRepo, account, class, observedAt); err != nil {
+		slog.Warn("persist_grok_automation_health_failed", "account_id", account.ID, "failure_class", class, "error", err)
+	}
+	// The health state is the authoritative gate. This durable block is a
+	// restart-safe fallback and is cleared early by a successful scheduled probe.
+	s.rateLimitGrok(stateCtx, account, observedAt.Add(automatedGrokFreeUsageSafetyCooldown))
 }
 
 func (s *OpenAIGatewayService) tempUnscheduleGrok(ctx context.Context, account *Account, cooldown time.Duration, reason string) {
