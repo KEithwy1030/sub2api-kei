@@ -356,6 +356,12 @@
         </span>
       </div>
       <div v-else-if="usageInfo" class="space-y-1">
+        <div
+          v-if="grokCredentialInvalid"
+          class="text-[10px] font-medium text-amber-700 dark:text-amber-300"
+        >
+          {{ t('admin.accounts.usageWindow.grokCredentialInvalidHistorical') }}
+        </div>
         <div v-if="grokEntitlementLabel" class="mb-0.5">
           <span class="inline-block rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200">
             {{ grokEntitlementLabel }}
@@ -629,6 +635,7 @@ import type { GrokQuotaProbeResult } from '@/api/admin/grok'
 import type { Account, AccountUsageInfo, GeminiCredentials, WindowStats } from '@/types'
 import { buildOpenAIUsageRefreshKey } from '@/utils/accountUsageRefresh'
 import { enqueueUsageRequest } from '@/utils/usageLoadQueue'
+import { isGrokOAuthCredentialInvalid } from '@/utils/grokAccountStatus'
 import { formatCompactNumber, formatRelativeTime } from '@/utils/format'
 import UsageProgressBar from './UsageProgressBar.vue'
 import AccountQuotaInfo from './AccountQuotaInfo.vue'
@@ -1128,6 +1135,7 @@ const grokQuotaUnknown = computed(() => {
   if (grokBilling.value || grokFreeTokenBar.value || grokRequestQuotaBar.value || grokTokenQuotaBar.value) return false
   return usageInfo.value?.grok_quota_snapshot_state !== 'observed'
 })
+const grokCredentialInvalid = computed(() => isGrokOAuthCredentialInvalid(props.account))
 const grokQuotaUnknownLabel = computed(() => {
   return usageInfo.value?.grok_quota_snapshot_state === 'no_headers'
     ? t('admin.accounts.usageWindow.grokNoHeaders')

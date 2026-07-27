@@ -400,6 +400,26 @@ func TestGrokQuotaServiceProbeUsageDoesNotRetryResponsesPost(t *testing.T) {
 	require.Equal(t, "/v1/responses", requests[0].URL.Path)
 }
 
+func TestGrokQuotaServiceProbeUsageReturnsConflictForInvalidCredential(t *testing.T) {
+	account := healthyGrokQuotaOAuthAccount(406)
+	account.Status = StatusError
+	account.Schedulable = false
+	account.ErrorMessage = `Token refresh failed (non-retryable): GROK_OAUTH_TOKEN_REFRESH_FAILED invalid_grant`
+	repo := &grokQuotaAccountRepo{mockAccountRepoForPlatform: &mockAccountRepoForPlatform{
+		accountsByID: map[int64]*Account{account.ID: account},
+	}}
+	upstream := &grokQuotaSequenceUpstream{}
+	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream, nil)
+
+	result, err := svc.ProbeUsage(context.Background(), account.ID)
+
+	require.Nil(t, result)
+	require.Error(t, err)
+	require.Equal(t, http.StatusConflict, infraerrors.Code(err))
+	require.Equal(t, "GROK_QUOTA_CREDENTIAL_INVALID", infraerrors.Reason(err))
+	require.Empty(t, upstream.snapshotRequests())
+}
+
 func TestGrokQuotaServiceProbeUsageStoresHeaders(t *testing.T) {
 	t.Parallel()
 

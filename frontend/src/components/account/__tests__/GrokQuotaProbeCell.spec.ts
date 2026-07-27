@@ -51,4 +51,33 @@ describe('GrokQuotaProbeCell', () => {
       probe_error: 'upstream returned 402 for probe model "grok-4.5"'
     })
   })
+
+  it('disables probing when the OAuth credential is invalid', async () => {
+    const wrapper = mount(GrokQuotaProbeCell, {
+      props: {
+        account: {
+          ...account,
+          status: 'error',
+          error_message: 'GROK_OAUTH_TOKEN_REFRESH_FAILED: invalid_grant'
+        } as Account
+      }
+    })
+
+    expect(wrapper.get('button').attributes('disabled')).toBeDefined()
+    await wrapper.get('button').trigger('click')
+    expect(queryQuota).not.toHaveBeenCalled()
+  })
+
+  it('replaces a Cloudflare HTML failure with a stable transport message', async () => {
+    queryQuota.mockRejectedValue({
+      message: 'The origin web server returned an invalid or incomplete response to Cloudflare.'
+    })
+    const wrapper = mount(GrokQuotaProbeCell, { props: { account } })
+
+    await wrapper.get('button').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('admin.accounts.usageWindow.grokProbeTransportError')
+    expect(wrapper.text()).not.toContain('origin web server')
+  })
 })

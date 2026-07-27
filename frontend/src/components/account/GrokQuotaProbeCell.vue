@@ -4,8 +4,10 @@
       <button
         type="button"
         class="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] font-medium text-cyan-700 transition-colors hover:bg-cyan-50 disabled:cursor-not-allowed disabled:opacity-50 dark:text-cyan-300 dark:hover:bg-cyan-900/30"
-        :disabled="loading"
-        :title="t('admin.accounts.usageWindow.grokProbeTooltip')"
+        :disabled="loading || credentialInvalid"
+        :title="credentialInvalid
+          ? t('admin.accounts.usageWindow.grokCredentialInvalidTooltip')
+          : t('admin.accounts.usageWindow.grokProbeTooltip')"
         @click="handleProbe"
       >
         <svg
@@ -50,6 +52,7 @@ import { useI18n } from 'vue-i18n'
 import { adminAPI } from '@/api/admin'
 import type { GrokQuotaProbeResult, GrokQuotaWindow } from '@/api/admin/grok'
 import type { Account } from '@/types'
+import { isGrokOAuthCredentialInvalid } from '@/utils/grokAccountStatus'
 
 const props = defineProps<{
   account: Account
@@ -60,6 +63,7 @@ const emit = defineEmits<{ probed: [result: GrokQuotaProbeResult] }>()
 const { t } = useI18n()
 
 const visible = computed(() => props.account.platform === 'grok' && props.account.type === 'oauth')
+const credentialInvalid = computed(() => isGrokOAuthCredentialInvalid(props.account))
 const loading = ref(false)
 const error = ref<string | null>(null)
 const data = ref<GrokQuotaProbeResult | null>(null)
@@ -68,15 +72,24 @@ const extractErrorMessage = (e: unknown): string => {
   const err = e as {
     message?: string
     reason?: string
-    response?: { data?: { message?: string; error?: string } }
+    response?: { data?: string | { message?: string; error?: string; reason?: string } }
   }
-  return (
-    err?.message ||
-    err?.reason ||
-    err?.response?.data?.message ||
-    err?.response?.data?.error ||
-    t('common.error')
-  )
+  const responseData = err?.response?.data
+  if (responseData && typeof responseData === 'object') {
+    return responseData.message || responseData.error || responseData.reason || t('common.error')
+  }
+  const rawMessage = typeof responseData === 'string'
+    ? responseData
+    : err?.reason || err?.message || ''
+  const normalized = rawMessage.toLowerCase()
+  if (
+    normalized.includes('cloudflare') ||
+    normalized.includes('origin web server returned an invalid or incomplete response') ||
+    normalized.includes('<!doctype html')
+  ) {
+    return t('admin.accounts.usageWindow.grokProbeTransportError')
+  }
+  return rawMessage || t('common.error')
 }
 
 const formatWindow = (label: string, window?: GrokQuotaWindow | null): string | null => {
@@ -123,7 +136,7 @@ const truncatedError = computed(() => {
 })
 
 const handleProbe = async () => {
-  if (loading.value) return
+  if (loading.value || credentialInvalid.value) return
   loading.value = true
   error.value = null
   try {

@@ -701,6 +701,40 @@ describe('AccountUsageCell', () => {
     expect(wrapper.text()).toContain('admin.accounts.usageWindow.grokTokens|25|true')
   })
 
+  it('Grok OAuth 凭据失效时把保留的配额标记为历史数据', async () => {
+    getUsage.mockResolvedValue({
+      grok_request_quota: { limit: 21, remaining: 21 },
+      grok_token_quota: { limit: 1_000_000, remaining: 1_000_000 },
+      grok_quota_snapshot_state: 'observed'
+    })
+
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({
+          id: 603,
+          platform: 'grok',
+          type: 'oauth',
+          status: 'error',
+          schedulable: false,
+          error_message: 'GROK_OAUTH_TOKEN_REFRESH_FAILED: invalid_grant'
+        })
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: true,
+          AccountQuotaInfo: true,
+          GrokQuotaProbeCell: true
+        }
+      }
+    })
+
+    await flushPromises()
+
+    expect(wrapper.text()).toContain(
+      'admin.accounts.usageWindow.grokCredentialInvalidHistorical'
+    )
+  })
+
   it('Grok OAuth uses the official weekly billing percentage when available', async () => {
     getUsage.mockResolvedValue({
       grok_billing: {

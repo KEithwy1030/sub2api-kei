@@ -475,6 +475,13 @@ func (s *GrokQuotaService) prepareProbe(ctx context.Context, accountID int64) (*
 	if err != nil {
 		return nil, "", "", err
 	}
+	if grokQuotaCredentialInvalid(account) {
+		return nil, "", "", infraerrors.New(
+			http.StatusConflict,
+			"GROK_QUOTA_CREDENTIAL_INVALID",
+			"Grok OAuth credential is invalid; existing quota values are historical",
+		)
+	}
 	proxyURL := s.resolveProxyURL(ctx, account)
 
 	token, err := s.tokenProvider.GetAccessToken(ctx, account)
@@ -486,6 +493,25 @@ func (s *GrokQuotaService) prepareProbe(ctx context.Context, accountID int64) (*
 	}
 
 	return account, token, proxyURL, nil
+}
+
+func grokQuotaCredentialInvalid(account *Account) bool {
+	if account == nil || !account.IsGrokOAuth() || account.Status != StatusError {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(account.ErrorMessage))
+	for _, marker := range []string{
+		"grok_oauth_token_refresh_failed",
+		"invalid_grant",
+		"token refresh failed (non-retryable)",
+		"grok oauth access token is expired",
+		"grok oauth refresh token is missing",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *GrokQuotaService) resolveProxyURL(ctx context.Context, account *Account) string {
