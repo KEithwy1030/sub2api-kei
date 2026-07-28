@@ -145,6 +145,53 @@ func TestResolveGrokCacheIdentityStabilizesGrokPagerAutomaticRecaps(t *testing.T
 	require.NotEqual(t, first, resolveGrokCacheIdentity(newRecapContext(303, "recap-fourth-uuid"), firstBody, "", "grok-4.5"))
 }
 
+func TestGenerateSessionHashStabilizesGrokPagerAutomaticRecaps(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	newRecapContext := func(recapID string) *gin.Context {
+		c := newGrokCacheTestContext(302)
+		c.Request.Header.Set("User-Agent", "grok-pager/0.2.112 grok-shell/0.2.112 (windows; x86_64)")
+		c.Request.Header.Set(grokConversationIDHeader, recapID)
+		return c
+	}
+
+	firstBody := []byte(`{"model":"grok-4.5-cached","input":[{"role":"system","content":"stable system"},{"role":"user","content":"initial task"},{"role":"assistant","content":"first result"}]}`)
+	secondBody := []byte(`{"model":"grok-4.5-cached","input":[{"role":"system","content":"stable system"},{"role":"user","content":"initial task"},{"role":"assistant","content":"first result"},{"role":"user","content":"continue"}]}`)
+	differentTaskBody := []byte(`{"model":"grok-4.5-cached","input":[{"role":"system","content":"stable system"},{"role":"user","content":"different task"}]}`)
+	service := &OpenAIGatewayService{}
+
+	first := service.GenerateSessionHash(newRecapContext("recap-first-uuid"), firstBody)
+	second := service.GenerateSessionHash(newRecapContext("recap-second-uuid"), secondBody)
+	require.NotEmpty(t, first)
+	require.Equal(t, first, second, "append-only automatic recaps must share one sticky account binding")
+	require.NotEqual(t, first, service.GenerateSessionHash(newRecapContext("recap-third-uuid"), differentTaskBody))
+}
+
+func TestGenerateSessionHashDoesNotRewriteOtherRecapSignals(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := &OpenAIGatewayService{}
+	body := []byte(`{"model":"grok-4.5-cached","input":[{"role":"user","content":"initial task"}]}`)
+
+	otherClient := newGrokCacheTestContext(304)
+	otherClient.Request.Header.Set("User-Agent", "other-client/1.0")
+	otherClient.Request.Header.Set(grokConversationIDHeader, "recap-first")
+	require.NotEqual(t,
+		service.GenerateSessionHash(otherClient, body),
+		service.GenerateSessionHash(func() *gin.Context {
+			c := newGrokCacheTestContext(304)
+			c.Request.Header.Set("User-Agent", "other-client/1.0")
+			c.Request.Header.Set(grokConversationIDHeader, "recap-second")
+			return c
+		}(), body),
+	)
+
+	explicitSession := newGrokCacheTestContext(304)
+	explicitSession.Request.Header.Set("User-Agent", "grok-pager/0.2.112 grok-shell/0.2.112 (windows; x86_64)")
+	explicitSession.Request.Header.Set("session_id", "recap-explicit-session")
+	explicitSession.Request.Header.Set(grokConversationIDHeader, "recap-native-conversation")
+	expected, _ := deriveOpenAISessionHashes("recap-explicit-session")
+	require.Equal(t, expected, service.GenerateSessionHash(explicitSession, body))
+}
+
 func TestResolveGrokCacheIdentityDoesNotRewriteUnrecognizedOrUnanchoredRecaps(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	firstBody := []byte(`{"model":"grok","input":[{"role":"user","content":"initial task"}]}`)

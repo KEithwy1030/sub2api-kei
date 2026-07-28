@@ -83,7 +83,7 @@ func resolveGrokCacheIdentity(c *gin.Context, body []byte, explicitKey, upstream
 	}
 
 	seed := explicitGrokCacheSeed(c, body, explicitKey)
-	seed = stabilizeGrokPagerRecapCacheSeed(c, body, seed)
+	seed = stabilizeGrokPagerRecapSeed(c, body, seed)
 	if seed == "" {
 		seed = deriveOpenAIStablePrefixSessionSeed(body)
 		if seed == "" {
@@ -106,11 +106,14 @@ func resolveGrokCacheIdentity(c *gin.Context, body []byte, explicitKey, upstream
 
 // Grok CLI generates a fresh recap-* conversation ID for every automatic
 // background recap even though each request extends the same history. Re-key
-// only that strict client fingerprint from the stable anchored prefix so xAI
-// can route successive recaps back to the server holding the shared prefix.
-func stabilizeGrokPagerRecapCacheSeed(c *gin.Context, body []byte, seed string) string {
+// only that strict client fingerprint from the stable anchored prefix so both
+// account scheduling and xAI cache routing preserve affinity across recaps.
+func stabilizeGrokPagerRecapSeed(c *gin.Context, body []byte, seed string) string {
 	seed = strings.TrimSpace(seed)
 	if c == nil || !strings.HasPrefix(seed, grokPagerRecapSeedPrefix) {
+		return seed
+	}
+	if strings.TrimSpace(c.GetHeader(grokConversationIDHeader)) != seed {
 		return seed
 	}
 	userAgent := strings.TrimSpace(c.GetHeader("User-Agent"))

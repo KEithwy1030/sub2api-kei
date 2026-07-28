@@ -119,6 +119,7 @@ func (s *OpenAIGatewayService) GenerateSessionHash(c *gin.Context, body []byte) 
 	}
 
 	sessionID := explicitOpenAIRequestSessionID(c, body)
+	sessionID = stabilizeGrokPagerRecapSeed(c, body, sessionID)
 	if sessionID == "" && len(body) > 0 {
 		sessionID = deriveOpenAIContentSessionSeed(body)
 	}
