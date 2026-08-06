@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/gin-gonic/gin"
@@ -20,19 +21,22 @@ type responsesFailedError struct {
 // responsesFailedBody 对齐 apicompat.makeResponsesCompletedEvent 输出的 response 子对象字段集。
 // Output 用空 slice（不是 nil）确保 marshal 为 `[]` 而非 `null`。
 type responsesFailedBody struct {
-	ID     string               `json:"id"`
-	Object string               `json:"object"`
-	Model  string               `json:"model,omitempty"`
-	Status string               `json:"status"`
-	Output []any                `json:"output"`
-	Error  responsesFailedError `json:"error"`
+	ID        string               `json:"id"`
+	Object    string               `json:"object"`
+	CreatedAt int64                `json:"created_at"`
+	Model     string               `json:"model,omitempty"`
+	Status    string               `json:"status"`
+	Output    []any                `json:"output"`
+	Error     responsesFailedError `json:"error"`
 }
 
 // responsesFailedEvent 是写入 SSE data 行的顶层结构。
-// 故意不带 sequence_number：spec 标记可选，且本函数被调用时无法可靠拿到 last seq。
+// Grok CLI 0.2.118 将 sequence_number 视为必填字段。handler 无法取得
+// 上游最后序号，因此使用与现有合成 error 事件一致的 0，保证客户端可解码。
 type responsesFailedEvent struct {
-	Type     string              `json:"type"`
-	Response responsesFailedBody `json:"response"`
+	Type           string              `json:"type"`
+	SequenceNumber int                 `json:"sequence_number"`
+	Response       responsesFailedBody `json:"response"`
 }
 
 // writeResponsesFailedSSE emits a `response.failed` SSE event in the OpenAI
@@ -44,9 +48,8 @@ type responsesFailedEvent struct {
 // Codex CLI 等严格 SDK 会因为没收到 `response.completed/failed/incomplete/cancelled`
 // 而抛出 "stream closed before response.completed"。
 //
-// 字段集对齐 apicompat.makeResponsesCompletedEvent：id/object/model/status/output/error。
-// 故意不写 sequence_number：本函数被调用时无法可靠拿到当前流的 last sequence，
-// 而 OpenAI spec 将 sequence_number 设为可选；省略避免破坏单调性约束。
+// 字段集对齐 apicompat.makeResponsesCompletedEvent：id/object/model/status/output/error，
+// 并带上严格 CLI 必需的 sequence_number。
 //
 // 返回 true 表示已尝试 SSE 写出（不论 Write 是否成功，caller 都应直接 return）。
 // 返回 false 表示 writer 不支持 Flusher，无法以 SSE 形式回报错误；
@@ -59,13 +62,15 @@ func writeResponsesFailedSSE(c *gin.Context, errType, message string) bool {
 	}
 
 	payload, err := json.Marshal(responsesFailedEvent{
-		Type: "response.failed",
+		Type:           "response.failed",
+		SequenceNumber: 0,
 		Response: responsesFailedBody{
-			ID:     synthesizeResponseID(c),
-			Object: "response",
-			Model:  requestModel(c),
-			Status: "failed",
-			Output: []any{},
+			ID:        synthesizeResponseID(c),
+			Object:    "response",
+			CreatedAt: time.Now().Unix(),
+			Model:     requestModel(c),
+			Status:    "failed",
+			Output:    []any{},
 			Error: responsesFailedError{
 				Code:    mapResponsesErrorCode(errType),
 				Message: message,

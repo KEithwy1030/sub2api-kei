@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -464,6 +465,10 @@ func TestForwardGrokChatViaResponsesStreamingPropagatesCachedUsage(t *testing.T)
 	}}
 	upstream := &httpUpstreamRecorder{resp: grokChatBridgeCompletedResponse("resp_grok_chat_stream", 4096)}
 	svc := &OpenAIGatewayService{
+		cfg: &config.Config{Gateway: config.GatewayConfig{
+			GrokFirstOutputTimeoutSeconds: 1,
+			MaxLineSize:                   defaultMaxLineSize,
+		}},
 		httpUpstream:      upstream,
 		grokTokenProvider: NewGrokTokenProvider(repo, nil),
 		accountRepo:       repo,
@@ -479,6 +484,105 @@ func TestForwardGrokChatViaResponsesStreamingPropagatesCachedUsage(t *testing.T)
 	require.Contains(t, recorder.Body.String(), `"content":"cached ok"`)
 	require.Contains(t, recorder.Body.String(), `"cached_tokens":4096`)
 	require.Contains(t, recorder.Body.String(), "data: [DONE]")
+}
+
+func TestForwardGrokChatViaResponsesFirstOutputTimeoutIncludesResponseHeaderWait(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"grok","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, grokChatRawEndpoint, bytes.NewReader(body))
+	c.Set("api_key", &APIKey{ID: 7211})
+
+	account := grokChatBridgeTestAccount(721)
+	repo := &grokQuotaAccountRepo{mockAccountRepoForPlatform: &mockAccountRepoForPlatform{
+		accountsByID: map[int64]*Account{account.ID: account},
+	}}
+	upstream := &blockingOpenAIResponseHeaderUpstream{canceled: make(chan struct{})}
+	svc := &OpenAIGatewayService{
+		cfg: &config.Config{Gateway: config.GatewayConfig{
+			GrokFirstOutputTimeoutSeconds: 1,
+			MaxLineSize:                   defaultMaxLineSize,
+		}},
+		httpUpstream:      upstream,
+		grokTokenProvider: NewGrokTokenProvider(repo, nil),
+		accountRepo:       repo,
+	}
+	started := time.Now()
+
+	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "")
+
+	require.Error(t, err)
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusGatewayTimeout, failoverErr.StatusCode)
+	require.True(t, failoverErr.SafeToFailoverAfterWrite)
+	require.Contains(t, string(failoverErr.ResponseBody), "first_output_timeout")
+	require.Less(t, time.Since(started), 1300*time.Millisecond)
+	require.Empty(t, recorder.Body.String())
+	select {
+	case <-upstream.canceled:
+	default:
+		t.Fatal("Grok Chat bridge response-header timeout did not cancel the upstream request")
+	}
+}
+
+func TestHandleGrokChatStreamingResponseFirstOutputTimeoutAfterHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
+		GrokFirstOutputTimeoutSeconds: 2,
+		StreamKeepaliveInterval:       1,
+		MaxLineSize:                   defaultMaxLineSize,
+	}}}
+	pr, pw := io.Pipe()
+	body := &firstOutputCloseTrackingBody{ReadCloser: pr, closed: make(chan struct{})}
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		defer func() { _ = pw.Close() }()
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_grok_chat_slow\"}}\n\n"))
+		<-body.closed
+	}()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, grokChatRawEndpoint, nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"X-Request-Id": []string{"request-grok-chat-slow"}},
+		Body:       body,
+	}
+
+	result, err := svc.handleChatStreamingResponseWithReasoning(
+		resp, c, grokChatBridgeTestAccount(722), "grok-4.5", "grok-4.5", "grok-4.5",
+		time.Now(), 0, "",
+	)
+
+	require.Error(t, err)
+	require.NotNil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusGatewayTimeout, failoverErr.StatusCode)
+	require.True(t, failoverErr.SafeToFailoverAfterWrite)
+	require.NotEmpty(t, recorder.Body.String(), "stable keepalive must protect the downstream proxy before timeout")
+	for _, line := range strings.Split(strings.TrimSpace(recorder.Body.String()), "\n") {
+		if line != "" {
+			require.True(t, strings.HasPrefix(line, ":"), "only SSE comments may precede failover: %q", line)
+		}
+	}
+	require.Empty(t, recorder.Header().Values("X-Request-Id"), "attempt-local upstream headers must stay private")
+	select {
+	case <-body.closed:
+	default:
+		t.Fatal("Grok Chat semantic-output timeout did not close the upstream body")
+	}
+	select {
+	case <-writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("Grok Chat stream reader did not exit after semantic-output timeout")
+	}
 }
 
 func TestForwardGrokChatRuntimeGateFallsBackToRaw(t *testing.T) {

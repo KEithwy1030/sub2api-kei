@@ -1,0 +1,433 @@
+From c87627c402ba0cf02db47bde9b027cbcb2b29ac1 Mon Sep 17 00:00:00 2001
+From: xiaohongshu <xiaohongshu@example.com>
+Date: Mon, 27 Jul 2026 07:11:38 +0800
+Subject: [PATCH] fix(grok): preserve cache affinity during slow-account
+ quarantine
+
+---
+ backend/internal/repository/account_repo.go   | 57 +++++++++++++++++++
+ .../account_repo_grok_slow_quarantine_test.go | 20 +++++++
+ .../service/openai_account_scheduler.go       | 21 ++++++-
+ .../service/openai_account_scheduler_test.go  | 51 +++++++++++++++++
+ .../service/openai_grok_slow_quarantine.go    | 54 ++++++++++++++++++
+ .../openai_grok_slow_quarantine_test.go       | 43 ++++++++++++++
+ .../scheduled_test_grok_cleanup_test.go       | 24 ++++++++
+ .../service/scheduled_test_runner_service.go  | 17 ++++++
+ 8 files changed, 285 insertions(+), 2 deletions(-)
+
+diff --git a/backend/internal/repository/account_repo.go b/backend/internal/repository/account_repo.go
+index 69d611ae..5e99c60f 100644
+--- a/backend/internal/repository/account_repo.go
++++ b/backend/internal/repository/account_repo.go
+@@ -2672,6 +2672,63 @@ func (r *accountRepository) ClearModelRateLimitsExceptActiveReasonPrefix(
+ 	return nil
+ }
+ 
++func (r *accountRepository) ClearModelRateLimitsByReasonPrefix(
++	ctx context.Context,
++	id int64,
++	reasonPrefix string,
++) (bool, error) {
++	result, err := r.sql.ExecContext(ctx, `
++		WITH locked AS MATERIALIZED (
++			SELECT a.id, a.extra
++			FROM accounts AS a
++			WHERE a.id = $1 AND a.deleted_at IS NULL
++			FOR UPDATE
++		),
++		filtered AS (
++			SELECT locked.id,
++				COALESCE(
++					jsonb_object_agg(entry.key, entry.value) FILTER (
++						WHERE entry.key IS NOT NULL
++							AND LEFT(COALESCE(entry.value->>'reason', ''), LENGTH($2)) <> $2
++					),
++					'{}'::jsonb
++				) AS model_limits,
++				BOOL_OR(
++					entry.key IS NOT NULL
++						AND LEFT(COALESCE(entry.value->>'reason', ''), LENGTH($2)) = $2
++				) AS matched
++			FROM locked
++			LEFT JOIN LATERAL jsonb_each(COALESCE(locked.extra->'model_rate_limits', '{}'::jsonb)) AS entry ON TRUE
++			GROUP BY locked.id
++		)
++		UPDATE accounts AS a
++		SET extra = CASE
++				WHEN filtered.model_limits = '{}'::jsonb THEN COALESCE(a.extra, '{}'::jsonb) - 'model_rate_limits'
++				ELSE jsonb_set(COALESCE(a.extra, '{}'::jsonb), '{model_rate_limits}'::text[], filtered.model_limits, true)
++			END,
++			updated_at = NOW()
++		FROM filtered
++		WHERE a.id = filtered.id AND filtered.matched`,
++		id,
++		reasonPrefix,
++	)
++	if err != nil {
++		return false, err
++	}
++	affected, err := result.RowsAffected()
++	if err != nil {
++		return false, err
++	}
++	if affected == 0 {
++		return false, nil
++	}
++	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
++		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue Grok slow-quarantine probe recovery failed: account=%d err=%v", id, err)
++	}
++	r.syncSchedulerAccountSnapshot(ctx, id)
++	return true, nil
++}
++
+ func (r *accountRepository) UpdateSessionWindow(ctx context.Context, id int64, start, end *time.Time, status string) error {
+ 	builder := r.client.Account.Update().
+ 		Where(dbaccount.IDEQ(id)).
+diff --git a/backend/internal/repository/account_repo_grok_slow_quarantine_test.go b/backend/internal/repository/account_repo_grok_slow_quarantine_test.go
+index 244bc5fa..31b13b87 100644
+--- a/backend/internal/repository/account_repo_grok_slow_quarantine_test.go
++++ b/backend/internal/repository/account_repo_grok_slow_quarantine_test.go
+@@ -52,3 +52,23 @@ func TestAccountRepository_ClearModelRateLimitsExceptActiveReasonPrefixUsesAtomi
+ 	require.Contains(t, normalized, "jsonb_object_agg(entry.key, entry.value) FILTER")
+ 	require.Contains(t, normalized, "rate_limit_reset_at')::timestamptz > $3")
+ }
++
++func TestAccountRepository_ClearModelRateLimitsByReasonPrefixUsesAtomicFilter(t *testing.T) {
++	exec := &recordingSQLExecutor{result: rowsAffectedResult(1)}
++	repo := newAccountRepositoryWithSQL(nil, exec, nil)
++
++	cleared, err := repo.ClearModelRateLimitsByReasonPrefix(
++		context.Background(),
++		42,
++		"grok slow ttft quarantine:",
++	)
++
++	require.NoError(t, err)
++	require.True(t, cleared)
++	require.GreaterOrEqual(t, len(exec.execQueries), 1)
++	normalized := normalizeSQLWhitespace(exec.execQueries[0])
++	require.Contains(t, normalized, "WITH locked AS MATERIALIZED")
++	require.Contains(t, normalized, "filtered AS (")
++	require.Contains(t, normalized, "BOOL_OR(")
++	require.Contains(t, normalized, "LEFT(COALESCE(entry.value->>'reason', ''), LENGTH($2)) <> $2")
++}
+diff --git a/backend/internal/service/openai_account_scheduler.go b/backend/internal/service/openai_account_scheduler.go
+index 5c548e4a..5b340c64 100644
+--- a/backend/internal/service/openai_account_scheduler.go
++++ b/backend/internal/service/openai_account_scheduler.go
+@@ -425,7 +425,18 @@ func (s *defaultOpenAIAccountScheduler) Select(
+ 			return selection, decision, nil
+ 		}
+ 		if escapedSticky {
+-			req.PreserveStickyBinding = true
++			if normalizeOpenAICompatiblePlatform(req.Platform) != PlatformGrok {
++				req.PreserveStickyBinding = true
++			} else if req.StickyAccountID > 0 {
++				// A Grok health escape must replace the binding. Otherwise load
++				// balancing can select the same unhealthy account again and the
++				// session pays repeated cold-cache failovers without progressing.
++				req.ExcludedIDs = cloneExcludedAccountIDs(req.ExcludedIDs)
++				if req.ExcludedIDs == nil {
++					req.ExcludedIDs = make(map[int64]struct{}, 1)
++				}
++				req.ExcludedIDs[req.StickyAccountID] = struct{}{}
++			}
+ 		}
+ 	}
+ 
+@@ -500,6 +511,12 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
+ 		return nil, false, nil
+ 	}
+ 	escapeCfg := s.service.openAIStickyEscapeConfig()
++	if account.Platform == PlatformGrok {
++		// Grok cache affinity is more valuable than escaping on historical TTFT.
++		// Persistent slow-account quarantine still rebinds the session once the
++		// account has produced enough slow samples to be classified as unhealthy.
++		escapeCfg.ttftMs = 0
++	}
+ 	if reason, errorRate, ttft, shouldEscape := s.shouldEscapeStickyAccount(accountID, escapeCfg); shouldEscape {
+ 		slog.Info("sticky_escape_triggered",
+ 			"account_id", accountID,
+@@ -577,7 +594,7 @@ func (s *defaultOpenAIAccountScheduler) shouldEscapeStickyAccount(accountID int6
+ 		return "", 0, 0, false
+ 	}
+ 	errorRate, ttft, hasTTFT := s.stats.snapshot(accountID)
+-	if hasTTFT && ttft > cfg.ttftMs {
++	if cfg.ttftMs > 0 && hasTTFT && ttft > cfg.ttftMs {
+ 		return "ttft", errorRate, ttft, true
+ 	}
+ 	if errorRate > cfg.errorRate {
+diff --git a/backend/internal/service/openai_account_scheduler_test.go b/backend/internal/service/openai_account_scheduler_test.go
+index 9ffa0799..92003d8e 100644
+--- a/backend/internal/service/openai_account_scheduler_test.go
++++ b/backend/internal/service/openai_account_scheduler_test.go
+@@ -2263,6 +2263,57 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyEscapeByTT
+ 	}
+ }
+ 
++func TestOpenAIGatewayService_SelectAccountWithScheduler_GrokStickyPreservesCacheAffinityDespiteTTFT(t *testing.T) {
++	ctx := context.Background()
++	groupID := int64(10105)
++	accounts := []Account{
++		{ID: 21601, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 0, GroupIDs: []int64{groupID}},
++		{ID: 21602, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 1, GroupIDs: []int64{groupID}},
++	}
++	cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{"openai:session_hash_grok_sticky_ttft": 21601}}
++	cfg := &config.Config{}
++	cfg.Gateway.OpenAIScheduler.StickyEscapeEnabled = true
++	cfg.Gateway.OpenAIScheduler.StickyEscapeTTFTMs = 15000
++	cfg.Gateway.OpenAIScheduler.StickyEscapeErrorRate = 0.5
++	svc := &OpenAIGatewayService{
++		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: accounts},
++		cache:              cache,
++		cfg:                cfg,
++		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("true"),
++		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{acquireResults: map[int64]bool{21601: true, 21602: true}}),
++		openaiAccountStats: newOpenAIAccountRuntimeStats(),
++	}
++	slowTTFT := 20000
++	svc.openaiAccountStats.report(21601, true, &slowTTFT)
++
++	selection, decision, err := svc.SelectAccountWithSchedulerForCapability(ctx, &groupID, "", "session_hash_grok_sticky_ttft", "grok-4.5", nil, OpenAIUpstreamTransportAny, "", false, false, false, PlatformGrok)
++	require.NoError(t, err)
++	require.NotNil(t, selection)
++	require.NotNil(t, selection.Account)
++	require.Equal(t, int64(21601), selection.Account.ID)
++	require.Equal(t, openAIAccountScheduleLayerSessionSticky, decision.Layer)
++	require.True(t, decision.StickySessionHit)
++	require.Equal(t, int64(21601), cache.sessionBindings["openai:session_hash_grok_sticky_ttft"])
++	if selection.ReleaseFunc != nil {
++		selection.ReleaseFunc()
++	}
++
++	for i := 0; i < 4; i++ {
++		svc.openaiAccountStats.report(21601, false, nil)
++	}
++	selection, decision, err = svc.SelectAccountWithSchedulerForCapability(ctx, &groupID, "", "session_hash_grok_sticky_ttft", "grok-4.5", nil, OpenAIUpstreamTransportAny, "", false, false, false, PlatformGrok)
++	require.NoError(t, err)
++	require.NotNil(t, selection)
++	require.NotNil(t, selection.Account)
++	require.Equal(t, int64(21602), selection.Account.ID)
++	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
++	require.False(t, decision.StickySessionHit)
++	require.Equal(t, int64(21602), cache.sessionBindings["openai:session_hash_grok_sticky_ttft"])
++	if selection.ReleaseFunc != nil {
++		selection.ReleaseFunc()
++	}
++}
++
+ func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyEscapeByErrorRate(t *testing.T) {
+ 	ctx := context.Background()
+ 	groupID := int64(10102)
+diff --git a/backend/internal/service/openai_grok_slow_quarantine.go b/backend/internal/service/openai_grok_slow_quarantine.go
+index 7f79d60d..1a8072cd 100644
+--- a/backend/internal/service/openai_grok_slow_quarantine.go
++++ b/backend/internal/service/openai_grok_slow_quarantine.go
+@@ -26,6 +26,14 @@ type grokSlowQuarantineRecoveryRepository interface {
+ 	ClearModelRateLimitsExceptActiveReasonPrefix(context.Context, int64, string, time.Time) error
+ }
+ 
++type grokSlowQuarantineProbeRecoveryRepository interface {
++	ClearModelRateLimitsByReasonPrefix(context.Context, int64, string) (bool, error)
++}
++
++type grokSlowQuarantineRuntimeClearer interface {
++	ClearGrokSlowTTFTQuarantine(int64)
++}
++
+ func (s *OpenAIGatewayService) EvaluateGrokSlowTTFTQuarantine(
+ 	ctx context.Context,
+ 	groupID *int64,
+@@ -153,6 +161,52 @@ func (s *OpenAIGatewayService) isGrokSlowTTFTQuarantined(account *Account, reque
+ 	return true
+ }
+ 
++func (s *OpenAIGatewayService) ClearGrokSlowTTFTQuarantine(accountID int64) {
++	if s == nil || accountID <= 0 {
++		return
++	}
++	s.grokSlowTTFTQuarantineUntil.Range(func(rawKey, _ any) bool {
++		key, ok := rawKey.(openAIAccountModelKey)
++		if ok && key.AccountID == accountID {
++			s.grokSlowTTFTQuarantineUntil.Delete(rawKey)
++		}
++		return true
++	})
++	s.grokSlowTTFTQuarantineStats.Range(func(rawKey, _ any) bool {
++		key, ok := rawKey.(openAIAccountModelKey)
++		if ok && key.AccountID == accountID {
++			s.grokSlowTTFTQuarantineStats.Delete(rawKey)
++		}
++		return true
++	})
++}
++
++func (s *RateLimitService) RecoverGrokSlowTTFTAfterFastProbe(ctx context.Context, accountID int64) (bool, error) {
++	if s == nil || s.accountRepo == nil || accountID <= 0 {
++		return false, nil
++	}
++	account, err := s.accountRepo.GetByID(ctx, accountID)
++	if err != nil {
++		return false, err
++	}
++	if !isActiveGrokSlowTTFTModelRateLimit(account, time.Now()) {
++		return false, nil
++	}
++	repo, ok := s.accountRepo.(grokSlowQuarantineProbeRecoveryRepository)
++	if !ok {
++		return false, fmt.Errorf("conditional Grok slow-quarantine probe recovery repository is unavailable")
++	}
++	cleared, err := repo.ClearModelRateLimitsByReasonPrefix(ctx, accountID, grokSlowTTFTQuarantineReasonPrefix)
++	if err != nil || !cleared {
++		return cleared, err
++	}
++	if runtime, ok := s.runtimeBlocker.(grokSlowQuarantineRuntimeClearer); ok {
++		runtime.ClearGrokSlowTTFTQuarantine(accountID)
++	}
++	s.notifyAccountSchedulingBlockCleared(accountID)
++	return true, nil
++}
++
+ func isActiveGrokSlowTTFTModelRateLimit(account *Account, now time.Time) bool {
+ 	if account == nil || account.Extra == nil {
+ 		return false
+diff --git a/backend/internal/service/openai_grok_slow_quarantine_test.go b/backend/internal/service/openai_grok_slow_quarantine_test.go
+index bbedde05..fb668fc9 100644
+--- a/backend/internal/service/openai_grok_slow_quarantine_test.go
++++ b/backend/internal/service/openai_grok_slow_quarantine_test.go
+@@ -243,11 +243,46 @@ func TestScheduledRecoveryPreservesActiveGrokSlowTTFTQuarantine(t *testing.T) {
+ 	require.True(t, repo.selectiveClearCalled)
+ }
+ 
++func TestFastProbeRecoveryClearsDurableAndRuntimeGrokSlowTTFTQuarantine(t *testing.T) {
++	resetAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
++	account := &Account{
++		ID:       43,
++		Status:   StatusActive,
++		Platform: PlatformGrok,
++		Type:     AccountTypeOAuth,
++		Extra: map[string]any{
++			modelRateLimitsKey: map[string]any{
++				"grok-4.5": map[string]any{
++					"rate_limit_reset_at": resetAt,
++					"reason":              "grok slow ttft quarantine: 25000ms (2 consecutive)",
++				},
++			},
++		},
++	}
++	repo := &grokSlowRecoveryAccountRepo{account: account}
++	gateway := &OpenAIGatewayService{}
++	key := openAIAccountModelKey{AccountID: account.ID, Model: "grok-4.5"}
++	gateway.grokSlowTTFTQuarantineUntil.Store(key, time.Now().Add(24*time.Hour))
++	gateway.grokSlowTTFTQuarantineStats.Store(key, &grokSlowTTFTQuarantineStat{until: time.Now().Add(24 * time.Hour)})
++	svc := &RateLimitService{accountRepo: repo, runtimeBlocker: gateway}
++
++	cleared, err := svc.RecoverGrokSlowTTFTAfterFastProbe(context.Background(), account.ID)
++
++	require.NoError(t, err)
++	require.True(t, cleared)
++	require.True(t, repo.probeClearCalled)
++	_, runtimeBlocked := gateway.grokSlowTTFTQuarantineUntil.Load(key)
++	require.False(t, runtimeBlocked)
++	_, statsRemain := gateway.grokSlowTTFTQuarantineStats.Load(key)
++	require.False(t, statsRemain)
++}
++
+ type grokSlowRecoveryAccountRepo struct {
+ 	AccountRepository
+ 	account              *Account
+ 	clearRateLimitCalled bool
+ 	selectiveClearCalled bool
++	probeClearCalled     bool
+ }
+ 
+ func (r *grokSlowRecoveryAccountRepo) GetByID(_ context.Context, _ int64) (*Account, error) {
+@@ -274,3 +309,11 @@ func (r *grokSlowRecoveryAccountRepo) ClearModelRateLimitsExceptActiveReasonPref
+ 	}
+ 	return nil
+ }
++
++func (r *grokSlowRecoveryAccountRepo) ClearModelRateLimitsByReasonPrefix(_ context.Context, _ int64, prefix string) (bool, error) {
++	r.probeClearCalled = true
++	if prefix != grokSlowTTFTQuarantineReasonPrefix {
++		return false, fmt.Errorf("unexpected reason prefix: %s", prefix)
++	}
++	return true, nil
++}
+diff --git a/backend/internal/service/scheduled_test_grok_cleanup_test.go b/backend/internal/service/scheduled_test_grok_cleanup_test.go
+index e0bbcd84..9d3ec137 100644
+--- a/backend/internal/service/scheduled_test_grok_cleanup_test.go
++++ b/backend/internal/service/scheduled_test_grok_cleanup_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/Wei-Shaw/sub2api/internal/config"
+ 	"github.com/stretchr/testify/require"
+ )
+ 
+@@ -136,3 +137,26 @@ func TestAutomatedGrokProbeCronsAreDeterministicAndStaggered(t *testing.T) {
+ 	require.Equal(t, automatedGrokActiveProbeCron(42), automatedGrokActiveProbeCron(42))
+ 	require.Contains(t, automatedGrokActiveProbeCron(42), ",")
+ }
++
++func TestScheduledProbeRecoversActiveGrokSlowTTFTQuarantineOnlyWhenFast(t *testing.T) {
++	cfg := &config.Config{}
++	cfg.Gateway.OpenAIScheduler.GrokSlowQuarantineTTFTMs = 20_000
++	runner := &ScheduledTestRunnerService{cfg: cfg, rateLimitSvc: &RateLimitService{}}
++	account := &Account{
++		ID:       44,
++		Platform: PlatformGrok,
++		Type:     AccountTypeOAuth,
++		Extra: map[string]any{
++			modelRateLimitsKey: map[string]any{
++				"grok-4.5": map[string]any{
++					"rate_limit_reset_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
++					"reason":              "grok slow ttft quarantine: 25000ms (2 consecutive)",
++				},
++			},
++		},
++	}
++
++	require.True(t, runner.shouldRecoverGrokSlowTTFTFromProbe(account, &ScheduledTestResult{Status: "success", LatencyMs: 12_000}))
++	require.False(t, runner.shouldRecoverGrokSlowTTFTFromProbe(account, &ScheduledTestResult{Status: "success", LatencyMs: 25_000}))
++	require.False(t, runner.shouldRecoverGrokSlowTTFTFromProbe(account, &ScheduledTestResult{Status: "failed", LatencyMs: 1_000}))
++}
+diff --git a/backend/internal/service/scheduled_test_runner_service.go b/backend/internal/service/scheduled_test_runner_service.go
+index 103a794f..8349338d 100644
+--- a/backend/internal/service/scheduled_test_runner_service.go
++++ b/backend/internal/service/scheduled_test_runner_service.go
+@@ -147,6 +147,14 @@ func (s *ScheduledTestRunnerService) runOnePlan(ctx context.Context, plan *Sched
+ 		if s.accountRepo != nil {
+ 			account, accountErr = s.accountRepo.GetByID(ctx, plan.AccountID)
+ 		}
++		if accountErr == nil && s.shouldRecoverGrokSlowTTFTFromProbe(account, result) {
++			recovered, recoverErr := s.rateLimitSvc.RecoverGrokSlowTTFTAfterFastProbe(ctx, plan.AccountID)
++			if recoverErr != nil {
++				logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d Grok slow-TTFT probe recovery failed: account=%d err=%v", plan.ID, plan.AccountID, recoverErr)
++			} else if recovered {
++				logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d cleared Grok slow-TTFT quarantine after fast probe: account=%d latency_ms=%d", plan.ID, plan.AccountID, result.LatencyMs)
++			}
++		}
+ 		if accountErr == nil && isAutomatedGrokQuarantined(account) {
+ 			s.tryPromoteQuarantinedAutomatedGrok(ctx, plan, result)
+ 		} else {
+@@ -171,6 +179,15 @@ func (s *ScheduledTestRunnerService) runOnePlan(ctx context.Context, plan *Sched
+ 	}
+ }
+ 
++func (s *ScheduledTestRunnerService) shouldRecoverGrokSlowTTFTFromProbe(account *Account, result *ScheduledTestResult) bool {
++	if s == nil || s.cfg == nil || s.rateLimitSvc == nil || account == nil || result == nil || result.Status != "success" {
++		return false
++	}
++	thresholdMs := s.cfg.Gateway.OpenAIScheduler.GrokSlowQuarantineTTFTMs
++	return thresholdMs > 0 && result.LatencyMs <= int64(thresholdMs) &&
++		isActiveGrokSlowTTFTModelRateLimit(account, time.Now())
++}
++
+ func (s *ScheduledTestRunnerService) recordAutomatedGrokHealth(ctx context.Context, plan *ScheduledTestPlan, result *ScheduledTestResult) bool {
+ 	if s == nil || s.accountRepo == nil || plan == nil || result == nil {
+ 		return false
+-- 
+2.53.0.windows.1
+

@@ -188,6 +188,13 @@
         <!-- Always allow on-demand upstream quota query, even before local data exists. -->
         <OpenAIQuotaResetCell :account="account" class="mt-1" />
       </div>
+      <div
+        v-if="error"
+        class="mt-1 max-w-[200px] truncate text-[10px] text-red-500"
+        :title="error"
+      >
+        {{ error }}
+      </div>
     </template>
 
     <!-- Antigravity OAuth accounts: fetch usage from API -->
@@ -1349,10 +1356,12 @@ const attachVisibilityObserver = () => {
 
 const loadActiveUsage = async () => {
   activeQueryLoading.value = true
+  error.value = null
   try {
     usageInfo.value = await adminAPI.accounts.getUsage(props.account.id, 'active', true)
   } catch (e: any) {
     console.error('Failed to load active usage:', e)
+    error.value = e?.message || t('common.error')
   } finally {
     activeQueryLoading.value = false
   }

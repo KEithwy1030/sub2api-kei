@@ -20,6 +20,8 @@ const (
 	grokFreeCacheNativeToolsJSON     = `[{"type":"web_search"},{"type":"x_search"}]`
 	grokFreeCacheDisabledToolChoice  = "none"
 	grokClientToolCacheOptInExtraKey = "grok_client_tool_cache_enabled"
+	grokPagerRecapSeedPrefix         = "recap-"
+	grokPagerRecapStableSeedPrefix   = "grok-pager-recap:"
 )
 
 // Claude Code metadata.user_id often ends with _session_<uuid>.
@@ -81,6 +83,7 @@ func resolveGrokCacheIdentity(c *gin.Context, body []byte, explicitKey, upstream
 	}
 
 	seed := explicitGrokCacheSeed(c, body, explicitKey)
+	seed = stabilizeGrokPagerRecapCacheSeed(c, body, seed)
 	if seed == "" {
 		seed = deriveOpenAIStablePrefixSessionSeed(body)
 		if seed == "" {
@@ -99,6 +102,26 @@ func resolveGrokCacheIdentity(c *gin.Context, body []byte, explicitKey, upstream
 	// upstream session identifiers derived by sub2api.
 	isolatedSeed := fmt.Sprintf("grok-prompt-cache:v1:%d:%s:%s", apiKeyID, model, seed)
 	return generateSessionUUID(isolatedSeed)
+}
+
+// Grok CLI generates a fresh recap-* conversation ID for every automatic
+// background recap even though each request extends the same history. Re-key
+// only that strict client fingerprint from the stable anchored prefix so xAI
+// can route successive recaps back to the server holding the shared prefix.
+func stabilizeGrokPagerRecapCacheSeed(c *gin.Context, body []byte, seed string) string {
+	seed = strings.TrimSpace(seed)
+	if c == nil || !strings.HasPrefix(seed, grokPagerRecapSeedPrefix) {
+		return seed
+	}
+	userAgent := strings.TrimSpace(c.GetHeader("User-Agent"))
+	if !strings.HasPrefix(userAgent, "grok-pager/") || !strings.Contains(userAgent, " grok-shell/") {
+		return seed
+	}
+	anchoredSeed := deriveOpenAIAnchoredContentSessionSeed(body)
+	if anchoredSeed == "" {
+		return seed
+	}
+	return grokPagerRecapStableSeedPrefix + anchoredSeed
 }
 
 func explicitGrokCacheSeed(c *gin.Context, body []byte, explicitKey string) string {

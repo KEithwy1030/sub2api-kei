@@ -52,3 +52,23 @@ func TestAccountRepository_ClearModelRateLimitsExceptActiveReasonPrefixUsesAtomi
 	require.Contains(t, normalized, "jsonb_object_agg(entry.key, entry.value) FILTER")
 	require.Contains(t, normalized, "rate_limit_reset_at')::timestamptz > $3")
 }
+
+func TestAccountRepository_ClearModelRateLimitsByReasonPrefixUsesAtomicFilter(t *testing.T) {
+	exec := &recordingSQLExecutor{result: rowsAffectedResult(1)}
+	repo := newAccountRepositoryWithSQL(nil, exec, nil)
+
+	cleared, err := repo.ClearModelRateLimitsByReasonPrefix(
+		context.Background(),
+		42,
+		"grok slow ttft quarantine:",
+	)
+
+	require.NoError(t, err)
+	require.True(t, cleared)
+	require.GreaterOrEqual(t, len(exec.execQueries), 1)
+	normalized := normalizeSQLWhitespace(exec.execQueries[0])
+	require.Contains(t, normalized, "WITH locked AS MATERIALIZED")
+	require.Contains(t, normalized, "filtered AS (")
+	require.Contains(t, normalized, "BOOL_OR(")
+	require.Contains(t, normalized, "LEFT(COALESCE(entry.value->>'reason', ''), LENGTH($2)) <> $2")
+}

@@ -3,9 +3,57 @@ package service
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestConsumeOpenAICodexProbeStream(t *testing.T) {
+	t.Parallel()
+
+	t.Run("waits for response completed", func(t *testing.T) {
+		stream := strings.NewReader("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
+			"data: {\"type\":\"response.completed\"}\n\n")
+		if err := consumeOpenAICodexProbeStream(stream); err != nil {
+			t.Fatalf("consumeOpenAICodexProbeStream() error = %v", err)
+		}
+	})
+
+	t.Run("rejects early eof", func(t *testing.T) {
+		stream := strings.NewReader("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n")
+		if err := consumeOpenAICodexProbeStream(stream); err == nil || !strings.Contains(err.Error(), "before response.completed") {
+			t.Fatalf("consumeOpenAICodexProbeStream() error = %v, want early completion error", err)
+		}
+	})
+
+	t.Run("surfaces upstream failure", func(t *testing.T) {
+		stream := strings.NewReader("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"model unavailable\"}}}\n\n")
+		if err := consumeOpenAICodexProbeStream(stream); err == nil || !strings.Contains(err.Error(), "model unavailable") {
+			t.Fatalf("consumeOpenAICodexProbeStream() error = %v, want upstream message", err)
+		}
+	})
+}
+
+func TestBuildCodexRateLimitWindowExtraUpdatesSkipsZeroWindow(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 2, 8, 0, 0, 0, time.UTC)
+	updates := buildCodexRateLimitWindowExtraUpdates(&OpenAIRateLimit{
+		PrimaryWindow: &OpenAIRateLimitWindow{
+			UsedPercent:        98,
+			LimitWindowSeconds: 7 * 24 * 60 * 60,
+			ResetAfterSeconds:  6 * 24 * 60 * 60,
+		},
+		SecondaryWindow: &OpenAIRateLimitWindow{},
+	}, now)
+
+	if _, ok := updates["codex_5h_used_percent"]; ok {
+		t.Fatalf("zero-length secondary window must not create a 5h snapshot: %#v", updates)
+	}
+	if got := updates["codex_7d_used_percent"]; got != 98.0 {
+		t.Fatalf("codex_7d_used_percent = %v, want 98", got)
+	}
+}
 
 type accountUsageCodexProbeRepo struct {
 	stubOpenAIAccountRepo

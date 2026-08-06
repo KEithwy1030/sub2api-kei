@@ -38,6 +38,9 @@ func (a *Account) getRateLimitRemainingForKey(key string) time.Duration {
 
 func (a *Account) isModelRateLimitedWithContext(ctx context.Context, requestedModel string) bool {
 	for _, key := range a.modelRateLimitKeysForRequest(ctx, requestedModel) {
+		if preserveGrokSlowTTFTStickyAffinity(ctx) && isActiveGrokSlowTTFTModelRateLimitKey(a, key, time.Now()) {
+			continue
+		}
 		if a.isRateLimitActiveForKey(key) {
 			return true
 		}
@@ -54,6 +57,9 @@ func (a *Account) GetModelRateLimitRemainingTime(requestedModel string) time.Dur
 func (a *Account) GetModelRateLimitRemainingTimeWithContext(ctx context.Context, requestedModel string) time.Duration {
 	remaining := time.Duration(0)
 	for _, key := range a.modelRateLimitKeysForRequest(ctx, requestedModel) {
+		if preserveGrokSlowTTFTStickyAffinity(ctx) && isActiveGrokSlowTTFTModelRateLimitKey(a, key, time.Now()) {
+			continue
+		}
 		if keyRemaining := a.getRateLimitRemainingForKey(key); keyRemaining > remaining {
 			remaining = keyRemaining
 		}

@@ -133,7 +133,7 @@ func TestGatewayModels_Grok45AdvertisesReasoningEffortForGrokBuild(t *testing.T)
 	require.Equal(t, http.StatusOK, rec.Code)
 	var got gatewayModelsResponseForTest
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
-	require.ElementsMatch(t, []string{"grok-4.5", "grok-4.5-cached"}, modelIDsForTest(got.Data))
+	require.ElementsMatch(t, []string{"grok-4.5"}, modelIDsForTest(got.Data))
 	var model gatewayModelItemForTest
 	for _, candidate := range got.Data {
 		if candidate.ID == "grok-4.5" {

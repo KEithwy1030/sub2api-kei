@@ -233,11 +233,29 @@ func (s *OpenAIGatewayService) openAIFirstOutputTimeout(reasoningEffort string) 
 	if s == nil || s.cfg == nil || s.cfg.Gateway.OpenAIFirstOutputTimeoutSeconds <= 0 {
 		return 0
 	}
-	seconds := s.cfg.Gateway.OpenAIFirstOutputTimeoutSeconds
+	return firstOutputTimeoutDuration(
+		s.cfg.Gateway.OpenAIFirstOutputTimeoutSeconds,
+		s.cfg.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds,
+		reasoningEffort,
+	)
+}
+
+func (s *OpenAIGatewayService) grokFirstOutputTimeout(reasoningEffort string) time.Duration {
+	if s == nil || s.cfg == nil || s.cfg.Gateway.GrokFirstOutputTimeoutSeconds <= 0 {
+		return 0
+	}
+	return firstOutputTimeoutDuration(
+		s.cfg.Gateway.GrokFirstOutputTimeoutSeconds,
+		s.cfg.Gateway.GrokHighEffortFirstOutputTimeoutSeconds,
+		reasoningEffort,
+	)
+}
+
+func firstOutputTimeoutDuration(seconds, highEffortSeconds int, reasoningEffort string) time.Duration {
 	switch strings.ToLower(strings.TrimSpace(reasoningEffort)) {
 	case "high", "xhigh", "max":
-		if override := s.cfg.Gateway.OpenAIHighEffortFirstOutputTimeoutSeconds; override > 0 {
-			seconds = override
+		if highEffortSeconds > 0 {
+			seconds = highEffortSeconds
 		}
 	}
 	return time.Duration(seconds) * time.Second

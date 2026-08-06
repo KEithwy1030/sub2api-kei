@@ -74,11 +74,13 @@ const (
 	// The Grok CLI proxy rejects requests that do not identify a supported
 	// client version. Keep a known-good stable version in the binary while
 	// allowing operators to bump it without waiting for a Sub2API release.
-	grokCLIProxyHost       = "cli-chat-proxy.grok.com"
-	grokOfficialAPIHost    = "api.x.ai"
-	grokCLIStableVersion   = "0.2.93"
-	grokCLIVersionOverride = "XAI_GROK_CLI_VERSION"
-	grokFallbackBodyLimit  = 64 << 10
+	grokCLIProxyHost           = "cli-chat-proxy.grok.com"
+	grokOfficialAPIHost        = "api.x.ai"
+	grokCLIStableVersion       = "0.2.93"
+	grokCLIVersionOverride     = "XAI_GROK_CLI_VERSION"
+	grokWebSearchHelperHeader  = "X-Sub2API-Grok-Web-Search-Helper"
+	grokWebSearchHelperVersion = "0.2.118"
+	grokFallbackBodyLimit      = 64 << 10
 )
 
 const (
@@ -394,6 +396,7 @@ func newGrokOfficialAPIFallbackRequest(req *http.Request) (*http.Request, error)
 	fallbackReq.Header = req.Header.Clone()
 	for _, header := range []string{
 		"X-XAI-Token-Auth",
+		"X-Grok-Model-Override",
 		"X-Grok-Client-Version",
 		"X-Grok-Client-Surface",
 		"X-UserID",
@@ -447,6 +450,19 @@ func applyGrokCLIProxyHeaders(req *http.Request) {
 	}
 	if req.Header == nil {
 		req.Header = make(http.Header)
+	}
+	webSearchHelper := strings.EqualFold(strings.TrimSpace(req.Header.Get(grokWebSearchHelperHeader)), "true")
+	req.Header.Del(grokWebSearchHelperHeader)
+	if webSearchHelper {
+		req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
+		req.Header.Set("X-AuthenticateResponse", "authenticate-response")
+		req.Header.Set("X-Grok-Client-Version", grokWebSearchHelperVersion)
+		if strings.TrimSpace(req.Header.Get("X-Grok-Client-Mode")) == "" {
+			req.Header.Set("X-Grok-Client-Mode", "interactive")
+		}
+		req.Header.Del("X-Grok-Client-Identifier")
+		req.Header.Del("User-Agent")
+		return
 	}
 	version := strings.TrimSpace(os.Getenv(grokCLIVersionOverride))
 	if !isSupportedGrokCLIVersion(version) {

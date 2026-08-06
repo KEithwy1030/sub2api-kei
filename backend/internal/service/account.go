@@ -614,9 +614,6 @@ func (a *Account) resolveModelMapping(rawMapping map[string]any) map[string]stri
 			})
 			applyAntigravityGemini31ProAliases(result)
 		}
-		if a.Platform == domain.PlatformGrok {
-			applyGrokCompatibilityAliases(result)
-		}
 		return result
 	}
 
@@ -628,18 +625,6 @@ func (a *Account) resolveModelMapping(rawMapping map[string]any) map[string]stri
 		return xai.DefaultModelMapping()
 	}
 	return nil
-}
-
-func applyGrokCompatibilityAliases(mapping map[string]string) {
-	if mapping == nil {
-		return
-	}
-	if _, exists := mapping["grok-4.5-cached"]; exists {
-		return
-	}
-	if target := strings.TrimSpace(mapping["grok-4.5"]); target != "" {
-		mapping["grok-4.5-cached"] = target
-	}
 }
 
 func mapPtr(m map[string]any) uintptr {

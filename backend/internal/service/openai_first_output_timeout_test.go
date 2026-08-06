@@ -164,6 +164,95 @@ func TestOpenAIFirstOutputTimeoutForReasoningEffort(t *testing.T) {
 	require.Equal(t, 300*time.Second, svc.openAIFirstOutputTimeout("max"))
 }
 
+func TestGrokFirstOutputTimeoutForReasoningEffort(t *testing.T) {
+	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
+		GrokFirstOutputTimeoutSeconds:           120,
+		GrokHighEffortFirstOutputTimeoutSeconds: 180,
+	}}}
+
+	require.Equal(t, 120*time.Second, svc.grokFirstOutputTimeout("low"))
+	require.Equal(t, 180*time.Second, svc.grokFirstOutputTimeout("high"))
+	require.Equal(t, 180*time.Second, svc.grokFirstOutputTimeout("xhigh"))
+	require.Equal(t, 180*time.Second, svc.grokFirstOutputTimeout("max"))
+}
+
+func TestGrokForwardFirstOutputTimeoutIncludesResponseHeaderWait(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := &blockingOpenAIResponseHeaderUpstream{canceled: make(chan struct{})}
+	svc := &OpenAIGatewayService{
+		cfg: &config.Config{Gateway: config.GatewayConfig{
+			GrokFirstOutputTimeoutSeconds: 1,
+			MaxLineSize:                   defaultMaxLineSize,
+		}},
+		httpUpstream: upstream,
+	}
+	body := []byte(`{"model":"grok-4.5","stream":true,"input":"hello"}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Set("api_key", &APIKey{ID: 9201})
+	account := &Account{
+		ID: 9201, Name: "grok-api-key", Platform: PlatformGrok, Type: AccountTypeAPIKey,
+		Status: StatusActive, Schedulable: true, Concurrency: 1,
+		Credentials: map[string]any{"api_key": "xai-test-key", "base_url": "https://api.x.ai/v1"},
+	}
+
+	started := time.Now()
+	_, err := svc.forwardGrokResponses(context.Background(), c, account, body, "grok-4.5", true, started)
+
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusGatewayTimeout, failoverErr.StatusCode)
+	require.Contains(t, string(failoverErr.ResponseBody), "first_output_timeout")
+	require.True(t, failoverErr.SafeToFailoverAfterWrite)
+	require.Less(t, time.Since(started), 1300*time.Millisecond)
+	require.Empty(t, rec.Body.String())
+	select {
+	case <-upstream.canceled:
+	default:
+		t.Fatal("Grok response-header timeout did not cancel the upstream request context")
+	}
+}
+
+func TestGrokNativeFirstOutputTimeoutAfterResponseHeaders(t *testing.T) {
+	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
+		GrokFirstOutputTimeoutSeconds: 1,
+		MaxLineSize:                   defaultMaxLineSize,
+	}}}
+	pr, pw := io.Pipe()
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		defer func() { _ = pw.Close() }()
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_grok_slow\"}}\n\n"))
+		time.Sleep(200 * time.Millisecond)
+	}()
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	body := &firstOutputCloseTrackingBody{ReadCloser: pr, closed: make(chan struct{})}
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: body}
+
+	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 9202, Platform: PlatformGrok}, time.Now().Add(-2*time.Second), "grok-4.5", "grok-4.5")
+
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusGatewayTimeout, failoverErr.StatusCode)
+	require.Empty(t, rec.Body.String())
+	select {
+	case <-body.closed:
+	default:
+		t.Fatal("Grok first-output timeout did not close the upstream response body")
+	}
+	select {
+	case <-writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("Grok stream reader did not exit after first-output timeout")
+	}
+}
+
 func TestOpenAIFirstOutputStageDefaultLimitIsIndependentFromScannerLimit(t *testing.T) {
 	stage := newDefaultOpenAIFirstOutputStage()
 	defer func() { require.NoError(t, stage.Close()) }()

@@ -499,8 +499,44 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	startTime time.Time,
 	requestBodyLen int,
 ) (*OpenAIForwardResult, error) {
+	return s.handleChatStreamingResponseWithReasoning(
+		resp, c, account, originalModel, billingModel, upstreamModel, startTime, requestBodyLen, "",
+	)
+}
+
+func (s *OpenAIGatewayService) handleChatStreamingResponseWithReasoning(
+	resp *http.Response,
+	c *gin.Context,
+	account *Account,
+	originalModel string,
+	billingModel string,
+	upstreamModel string,
+	startTime time.Time,
+	requestBodyLen int,
+	reasoningEffort string,
+) (*OpenAIForwardResult, error) {
 	requestID := resp.Header.Get("x-request-id")
+	firstOutputTimeout := time.Duration(0)
+	if account != nil && account.Platform == PlatformGrok {
+		firstOutputTimeout = s.grokFirstOutputTimeout(reasoningEffort)
+	}
+	guardFirstOutput := firstOutputTimeout > 0
 	writeStreamHeaders := s.newStreamHeaderWriter(c, resp.Header)
+	if guardFirstOutput {
+		headersWritten := false
+		writeStreamHeaders = func() {
+			if headersWritten {
+				return
+			}
+			headersWritten = true
+			// Keep the proxy connection alive without committing attempt-local
+			// upstream headers before an account failover remains possible.
+			c.Header("Content-Type", "text/event-stream")
+			c.Header("Cache-Control", "no-cache")
+			c.Header("Connection", "keep-alive")
+			c.Header("X-Accel-Buffering", "no")
+		}
+	}
 
 	state := apicompat.NewResponsesEventToChatState()
 	state.Model = originalModel
@@ -517,6 +553,30 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	refusalDetector := newOpenAIChatSilentRefusalDetector(requestBodyLen)
 	var streamFailoverErr *UpstreamFailoverError
 	var streamNonFailoverErr error
+	var firstOutputTimer *time.Timer
+	var firstOutputCh <-chan time.Time
+	if guardFirstOutput {
+		remaining := time.Until(startTime.Add(firstOutputTimeout))
+		if remaining <= 0 {
+			remaining = time.Nanosecond
+		}
+		firstOutputTimer = time.NewTimer(remaining)
+		firstOutputCh = firstOutputTimer.C
+	}
+	stopFirstOutputTimer := func() {
+		if firstOutputTimer == nil {
+			return
+		}
+		if !firstOutputTimer.Stop() {
+			select {
+			case <-firstOutputTimer.C:
+			default:
+			}
+		}
+		firstOutputTimer = nil
+		firstOutputCh = nil
+	}
+	defer stopFirstOutputTimer()
 
 	scanner := s.newUpstreamSSEScanner(resp.Body)
 
@@ -548,7 +608,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	}
 
 	processDataLine := func(payload string) bool {
-		if firstChunk {
+		if firstChunk && !guardFirstOutput {
 			firstChunk = false
 			ms := int(time.Since(startTime).Milliseconds())
 			firstTokenMs = &ms
@@ -563,6 +623,13 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 			return false
 		}
 		refusalDetector.ObservePayload([]byte(payload))
+		startsClientOutput := openAIStreamDataStartsClientOutput(payload, event.Type)
+		if guardFirstOutput && firstTokenMs == nil && startsClientOutput {
+			firstChunk = false
+			ms := int(time.Since(startTime).Milliseconds())
+			firstTokenMs = &ms
+			stopFirstOutputTimer()
+		}
 
 		isTerminalEvent := isOpenAICompatResponsesTerminalEvent(event.Type)
 		if isTerminalEvent {
@@ -660,7 +727,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 					)
 					continue
 				}
-				if !clientOutputStarted && !refusalDetector.ShouldReleaseClientOutput() {
+				if !clientOutputStarted && ((guardFirstOutput && firstTokenMs == nil) || !refusalDetector.ShouldReleaseClientOutput()) {
 					pendingSSE = append(pendingSSE, sse)
 					continue
 				}
@@ -805,7 +872,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	}
 
 	// No keepalive: fast synchronous path
-	if streamInterval <= 0 && keepaliveInterval <= 0 {
+	if streamInterval <= 0 && keepaliveInterval <= 0 && !guardFirstOutput {
 		var parser openAICompatSSEFrameParser
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -843,7 +910,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 		line string
 		err  error
 	}
-	events := make(chan scanEvent, 16)
+	events := make(chan scanEvent, openAIFirstOutputEventQueueSize(guardFirstOutput))
 	done := make(chan struct{})
 	var lastReadAt int64
 	atomic.StoreInt64(&lastReadAt, time.Now().UnixNano())
@@ -929,6 +996,23 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 				zap.Duration("interval", streamInterval),
 			)
 			return resultWithUsage(), fmt.Errorf("stream data interval timeout")
+
+		case <-firstOutputCh:
+			if firstTokenMs != nil {
+				stopFirstOutputTimer()
+				continue
+			}
+			_ = resp.Body.Close()
+			for range events {
+			}
+			requestCtx := context.Background()
+			if c != nil && c.Request != nil {
+				requestCtx = c.Request.Context()
+			}
+			return resultWithUsage(), s.newOpenAIFirstOutputTimeoutError(
+				requestCtx, c, account, startTime, originalModel, reasoningEffort,
+				firstOutputTimeout, "semantic_output", resp.Header,
+			)
 
 		case <-keepaliveCh:
 			if clientDisconnected {

@@ -2672,6 +2672,63 @@ func (r *accountRepository) ClearModelRateLimitsExceptActiveReasonPrefix(
 	return nil
 }
 
+func (r *accountRepository) ClearModelRateLimitsByReasonPrefix(
+	ctx context.Context,
+	id int64,
+	reasonPrefix string,
+) (bool, error) {
+	result, err := r.sql.ExecContext(ctx, `
+		WITH locked AS MATERIALIZED (
+			SELECT a.id, a.extra
+			FROM accounts AS a
+			WHERE a.id = $1 AND a.deleted_at IS NULL
+			FOR UPDATE
+		),
+		filtered AS (
+			SELECT locked.id,
+				COALESCE(
+					jsonb_object_agg(entry.key, entry.value) FILTER (
+						WHERE entry.key IS NOT NULL
+							AND LEFT(COALESCE(entry.value->>'reason', ''), LENGTH($2)) <> $2
+					),
+					'{}'::jsonb
+				) AS model_limits,
+				BOOL_OR(
+					entry.key IS NOT NULL
+						AND LEFT(COALESCE(entry.value->>'reason', ''), LENGTH($2)) = $2
+				) AS matched
+			FROM locked
+			LEFT JOIN LATERAL jsonb_each(COALESCE(locked.extra->'model_rate_limits', '{}'::jsonb)) AS entry ON TRUE
+			GROUP BY locked.id
+		)
+		UPDATE accounts AS a
+		SET extra = CASE
+				WHEN filtered.model_limits = '{}'::jsonb THEN COALESCE(a.extra, '{}'::jsonb) - 'model_rate_limits'
+				ELSE jsonb_set(COALESCE(a.extra, '{}'::jsonb), '{model_rate_limits}'::text[], filtered.model_limits, true)
+			END,
+			updated_at = NOW()
+		FROM filtered
+		WHERE a.id = filtered.id AND filtered.matched`,
+		id,
+		reasonPrefix,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue Grok slow-quarantine probe recovery failed: account=%d err=%v", id, err)
+	}
+	r.syncSchedulerAccountSnapshot(ctx, id)
+	return true, nil
+}
+
 func (r *accountRepository) UpdateSessionWindow(ctx context.Context, id int64, start, end *time.Time, status string) error {
 	builder := r.client.Account.Update().
 		Where(dbaccount.IDEQ(id)).

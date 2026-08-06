@@ -306,9 +306,17 @@ func (s *OpenAIGatewayService) isOpenAIAccountModelRuntimeBlocked(account *Accou
 }
 
 func (s *OpenAIGatewayService) isOpenAIAccountRequestRuntimeBlocked(account *Account, requestedModel string) bool {
+	return s.isOpenAIAccountRequestRuntimeBlockedWithContext(context.Background(), account, requestedModel)
+}
+
+func (s *OpenAIGatewayService) isOpenAIAccountRequestRuntimeBlockedWithContext(ctx context.Context, account *Account, requestedModel string) bool {
+	slowTTFTBlocked := s != nil && s.isGrokSlowTTFTQuarantined(account, requestedModel)
+	if slowTTFTBlocked && preserveGrokSlowTTFTStickyAffinity(ctx) {
+		slowTTFTBlocked = false
+	}
 	return s != nil && (s.isOpenAIAccountRuntimeBlocked(account) ||
 		s.isOpenAIAccountModelRuntimeBlocked(account, requestedModel) ||
-		s.isGrokSlowTTFTQuarantined(account, requestedModel))
+		slowTTFTBlocked)
 }
 
 func (s *OpenAIGatewayService) recordOpenAIOAuth429() {

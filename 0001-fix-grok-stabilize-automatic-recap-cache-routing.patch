@@ -1,0 +1,114 @@
+From f77a4a73eb244355dab35c5608a0ddf1c027ecad Mon Sep 17 00:00:00 2001
+From: xiaohongshu <xiaohongshu@example.com>
+Date: Mon, 27 Jul 2026 08:36:10 +0800
+Subject: [PATCH] fix(grok): stabilize automatic recap cache routing
+
+---
+ .../service/openai_gateway_grok_cache.go      | 23 ++++++++++
+ .../service/openai_gateway_grok_cache_test.go | 42 +++++++++++++++++++
+ 2 files changed, 65 insertions(+)
+
+diff --git a/backend/internal/service/openai_gateway_grok_cache.go b/backend/internal/service/openai_gateway_grok_cache.go
+index 170528ce..2c332bc3 100644
+--- a/backend/internal/service/openai_gateway_grok_cache.go
++++ b/backend/internal/service/openai_gateway_grok_cache.go
+@@ -20,6 +20,8 @@ const (
+ 	grokFreeCacheNativeToolsJSON     = `[{"type":"web_search"},{"type":"x_search"}]`
+ 	grokFreeCacheDisabledToolChoice  = "none"
+ 	grokClientToolCacheOptInExtraKey = "grok_client_tool_cache_enabled"
++	grokPagerRecapSeedPrefix         = "recap-"
++	grokPagerRecapStableSeedPrefix   = "grok-pager-recap:"
+ )
+ 
+ // Claude Code metadata.user_id often ends with _session_<uuid>.
+@@ -81,6 +83,7 @@ func resolveGrokCacheIdentity(c *gin.Context, body []byte, explicitKey, upstream
+ 	}
+ 
+ 	seed := explicitGrokCacheSeed(c, body, explicitKey)
++	seed = stabilizeGrokPagerRecapCacheSeed(c, body, seed)
+ 	if seed == "" {
+ 		seed = deriveOpenAIStablePrefixSessionSeed(body)
+ 		if seed == "" {
+@@ -101,6 +104,26 @@ func resolveGrokCacheIdentity(c *gin.Context, body []byte, explicitKey, upstream
+ 	return generateSessionUUID(isolatedSeed)
+ }
+ 
++// Grok CLI generates a fresh recap-* conversation ID for every automatic
++// background recap even though each request extends the same history. Re-key
++// only that strict client fingerprint from the stable anchored prefix so xAI
++// can route successive recaps back to the server holding the shared prefix.
++func stabilizeGrokPagerRecapCacheSeed(c *gin.Context, body []byte, seed string) string {
++	seed = strings.TrimSpace(seed)
++	if c == nil || !strings.HasPrefix(seed, grokPagerRecapSeedPrefix) {
++		return seed
++	}
++	userAgent := strings.TrimSpace(c.GetHeader("User-Agent"))
++	if !strings.HasPrefix(userAgent, "grok-pager/") || !strings.Contains(userAgent, " grok-shell/") {
++		return seed
++	}
++	anchoredSeed := deriveOpenAIAnchoredContentSessionSeed(body)
++	if anchoredSeed == "" {
++		return seed
++	}
++	return grokPagerRecapStableSeedPrefix + anchoredSeed
++}
++
+ func explicitGrokCacheSeed(c *gin.Context, body []byte, explicitKey string) string {
+ 	// Claude Code session is the most stable multi-turn identity for
+ 	// /v1/messages → Grok bridges. Prefer it over generic session headers so
+diff --git a/backend/internal/service/openai_gateway_grok_cache_test.go b/backend/internal/service/openai_gateway_grok_cache_test.go
+index dc3beaa4..8cc8459d 100644
+--- a/backend/internal/service/openai_gateway_grok_cache_test.go
++++ b/backend/internal/service/openai_gateway_grok_cache_test.go
+@@ -124,6 +124,48 @@ func TestResolveGrokCacheIdentityUsesAndIsolatesNativeConversationHeader(t *test
+ 	require.NotContains(t, first, "raw-native-conversation")
+ }
+ 
++func TestResolveGrokCacheIdentityStabilizesGrokPagerAutomaticRecaps(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	newRecapContext := func(apiKeyID int64, recapID string) *gin.Context {
++		c := newGrokCacheTestContext(apiKeyID)
++		c.Request.Header.Set("User-Agent", "grok-pager/0.2.112 grok-shell/0.2.112 (windows; x86_64)")
++		c.Request.Header.Set(grokConversationIDHeader, recapID)
++		return c
++	}
++
++	firstBody := []byte(`{"model":"grok-4.5-cached","input":[{"role":"system","content":"stable system"},{"role":"user","content":"initial task"},{"role":"assistant","content":"first result"}]}`)
++	secondBody := []byte(`{"model":"grok-4.5-cached","input":[{"role":"system","content":"stable system"},{"role":"user","content":"initial task"},{"role":"assistant","content":"first result"},{"role":"user","content":"continue"}]}`)
++	differentTaskBody := []byte(`{"model":"grok-4.5-cached","input":[{"role":"system","content":"stable system"},{"role":"user","content":"different task"}]}`)
++
++	first := resolveGrokCacheIdentity(newRecapContext(302, "recap-first-uuid"), firstBody, "", "grok-4.5")
++	second := resolveGrokCacheIdentity(newRecapContext(302, "recap-second-uuid"), secondBody, "", "grok-4.5")
++	require.NotEmpty(t, first)
++	require.Equal(t, first, second, "append-only automatic recaps must share one cache routing identity")
++	require.NotEqual(t, first, resolveGrokCacheIdentity(newRecapContext(302, "recap-third-uuid"), differentTaskBody, "", "grok-4.5"))
++	require.NotEqual(t, first, resolveGrokCacheIdentity(newRecapContext(303, "recap-fourth-uuid"), firstBody, "", "grok-4.5"))
++}
++
++func TestResolveGrokCacheIdentityDoesNotRewriteUnrecognizedOrUnanchoredRecaps(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	firstBody := []byte(`{"model":"grok","input":[{"role":"user","content":"initial task"}]}`)
++	secondBody := []byte(`{"model":"grok","input":[{"role":"user","content":"initial task"},{"role":"assistant","content":"result"}]}`)
++
++	otherClient := newGrokCacheTestContext(304)
++	otherClient.Request.Header.Set("User-Agent", "other-client/1.0")
++	otherClient.Request.Header.Set(grokConversationIDHeader, "recap-first")
++	otherFirst := resolveGrokCacheIdentity(otherClient, firstBody, "", "grok-4.5")
++	otherClient.Request.Header.Set(grokConversationIDHeader, "recap-second")
++	require.NotEqual(t, otherFirst, resolveGrokCacheIdentity(otherClient, secondBody, "", "grok-4.5"))
++
++	unanchored := newGrokCacheTestContext(304)
++	unanchored.Request.Header.Set("User-Agent", "grok-pager/0.2.112 grok-shell/0.2.112 (windows; x86_64)")
++	unanchored.Request.Header.Set(grokConversationIDHeader, "recap-first")
++	assistantOnly := []byte(`{"model":"grok","input":[{"role":"assistant","content":"result"}]}`)
++	unanchoredFirst := resolveGrokCacheIdentity(unanchored, assistantOnly, "", "grok-4.5")
++	unanchored.Request.Header.Set(grokConversationIDHeader, "recap-second")
++	require.NotEqual(t, unanchoredFirst, resolveGrokCacheIdentity(unanchored, assistantOnly, "", "grok-4.5"))
++}
++
+ func TestResolveGrokCacheIdentityExplicitHeaderPriority(t *testing.T) {
+ 	gin.SetMode(gin.TestMode)
+ 	body := []byte(`{"model":"grok","prompt_cache_key":"body-key","input":"hi"}`)
+-- 
+2.53.0.windows.1
+

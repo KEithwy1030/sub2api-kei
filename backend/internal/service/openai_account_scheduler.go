@@ -425,7 +425,18 @@ func (s *defaultOpenAIAccountScheduler) Select(
 			return selection, decision, nil
 		}
 		if escapedSticky {
-			req.PreserveStickyBinding = true
+			if normalizeOpenAICompatiblePlatform(req.Platform) != PlatformGrok {
+				req.PreserveStickyBinding = true
+			} else if req.StickyAccountID > 0 {
+				// A Grok health escape must replace the binding. Otherwise load
+				// balancing can select the same unhealthy account again and the
+				// session pays repeated cold-cache failovers without progressing.
+				req.ExcludedIDs = cloneExcludedAccountIDs(req.ExcludedIDs)
+				if req.ExcludedIDs == nil {
+					req.ExcludedIDs = make(map[int64]struct{}, 1)
+				}
+				req.ExcludedIDs[req.StickyAccountID] = struct{}{}
+			}
 		}
 	}
 
@@ -483,23 +494,30 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, false, nil
 	}
-	if shouldClearStickySession(account, req.RequestedModel) || account.Platform != normalizeOpenAICompatiblePlatform(req.Platform) || !account.IsOpenAICompatible() || !account.IsSchedulable() {
+	stickyCtx := withGrokSlowTTFTStickyAffinity(ctx, account)
+	if shouldClearStickySessionWithContext(stickyCtx, account, req.RequestedModel) || account.Platform != normalizeOpenAICompatiblePlatform(req.Platform) || !account.IsOpenAICompatible() || !account.IsSchedulable() {
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, false, nil
 	}
-	if !s.isAccountRequestCompatible(ctx, account, req) {
+	if !s.isAccountRequestCompatible(stickyCtx, account, req) {
 		return nil, false, nil
 	}
 	if !s.isAccountTransportCompatible(account, req.RequiredTransport) {
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, false, nil
 	}
-	account = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
+	account = s.service.recheckSelectedOpenAIAccountFromDB(stickyCtx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
 	if account == nil || !s.service.openAIAccountMatchesSchedulingGroup(account, req.GroupID) || !s.isAccountTransportCompatible(account, req.RequiredTransport) {
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, false, nil
 	}
 	escapeCfg := s.service.openAIStickyEscapeConfig()
+	if account.Platform == PlatformGrok {
+		// Grok cache affinity is more valuable than escaping on historical TTFT.
+		// Persistent slow-account quarantine still rebinds the session once the
+		// account has produced enough slow samples to be classified as unhealthy.
+		escapeCfg.ttftMs = 0
+	}
 	if reason, errorRate, ttft, shouldEscape := s.shouldEscapeStickyAccount(accountID, escapeCfg); shouldEscape {
 		slog.Info("sticky_escape_triggered",
 			"account_id", accountID,
@@ -577,7 +595,7 @@ func (s *defaultOpenAIAccountScheduler) shouldEscapeStickyAccount(accountID int6
 		return "", 0, 0, false
 	}
 	errorRate, ttft, hasTTFT := s.stats.snapshot(accountID)
-	if hasTTFT && ttft > cfg.ttftMs {
+	if cfg.ttftMs > 0 && hasTTFT && ttft > cfg.ttftMs {
 		return "ttft", errorRate, ttft, true
 	}
 	if errorRate > cfg.errorRate {
@@ -1676,8 +1694,14 @@ func (s *defaultOpenAIAccountScheduler) isAccountRequestCompatibleReason(ctx con
 	if account == nil {
 		return false, "account_nil"
 	}
-	if s != nil && s.service != nil && s.service.isOpenAIAccountRequestRuntimeBlocked(account, req.RequestedModel) {
+	if s != nil && s.service != nil && s.service.isOpenAIAccountRequestRuntimeBlockedWithContext(ctx, account, req.RequestedModel) {
 		return false, "runtime_blocked"
+	}
+	// Persisted model-level rate limits must be applied before Top-K ranking.
+	// Otherwise quarantined accounts can crowd healthy accounts out of Top-K,
+	// only to be rejected by the later fresh/DB recheck.
+	if !account.IsSchedulableForModelWithContext(ctx, req.RequestedModel) {
+		return false, "model_rate_limited"
 	}
 	if s != nil && s.service != nil && s.service.isOpenAIProxyStreamQuarantined(account) {
 		return false, "proxy_stream_quarantined"

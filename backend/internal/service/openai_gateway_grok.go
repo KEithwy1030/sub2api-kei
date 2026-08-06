@@ -24,6 +24,7 @@ const (
 	grokComposerImageBridgeMaxOutputTokens = 512
 	grokUpstreamUserAgent                  = "sub2api-grok/1.0"
 	grokCLIVersion                         = "0.2.93"
+	grokWebSearchHelperMarkerHeader        = "X-Sub2API-Grok-Web-Search-Helper"
 	grokDefaultResponsesModel              = "grok-4.5"
 	grokRateLimitFallbackCooldown          = 2 * time.Minute
 	grokRateLimitRepeatCooldown            = 10 * time.Minute
@@ -90,8 +91,15 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		return nil, err
 	}
 
-	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
-	defer releaseUpstreamCtx()
+	reasoningEffort := extractOpenAIReasoningEffortFromBody(patchedBody, originalModel)
+	reasoningEffortValue := ""
+	if reasoningEffort != nil {
+		reasoningEffortValue = *reasoningEffort
+	}
+	firstOutputTimeout := time.Duration(0)
+	if reqStream {
+		firstOutputTimeout = s.grokFirstOutputTimeout(reasoningEffortValue)
+	}
 
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
@@ -101,15 +109,47 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	upstreamStart := time.Now()
 	var resp *http.Response
 	for attempt := 0; ; attempt++ {
+		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+		var headerGuard *openAIFirstOutputHeaderGuard
+		if firstOutputTimeout > 0 {
+			upstreamCtx, headerGuard = newOpenAIFirstOutputHeaderGuard(
+				upstreamCtx, releaseUpstreamCtx, startTime.Add(firstOutputTimeout),
+			)
+		}
 		upstreamReq, buildErr := buildGrokResponsesRequest(upstreamCtx, c, account, patchedBody, token, cacheIdentity, s.cfg)
+		if headerGuard == nil {
+			releaseUpstreamCtx()
+		}
 		if buildErr != nil {
+			if headerGuard != nil {
+				headerGuard.close()
+			}
 			return nil, buildErr
 		}
 
 		resp, err = s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
+		if headerGuard != nil && headerGuard.stopHeaderWait() {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			headerGuard.close()
+			return nil, s.newOpenAIFirstOutputTimeoutError(
+				ctx, c, account, startTime, originalModel, reasoningEffortValue,
+				firstOutputTimeout, "response_headers", nil,
+			)
+		}
 		if err != nil {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			if headerGuard != nil {
+				headerGuard.close()
+			}
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+		}
+		if headerGuard != nil {
+			resp.Body = &openAIRequestContextReadCloser{ReadCloser: resp.Body, cleanup: headerGuard.close}
 		}
 
 		// xAI can reject encrypted reasoning copied from a response produced under
@@ -186,7 +226,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 			}
 			resp.Body = newGrokResponsesClientToolStreamBody(resp.Body, clientToolMapping, maxLineSize)
 		}
-		streamResult, err := s.handleStreamingResponse(ctx, resp, c, account, startTime, originalModel, upstreamModel)
+		streamResult, err := s.handleStreamingResponseWithReasoning(ctx, resp, c, account, startTime, originalModel, upstreamModel, reasoningEffortValue)
 		if err != nil {
 			return nil, err
 		}
@@ -205,7 +245,6 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	if usage == nil {
 		usage = &OpenAIUsage{}
 	}
-	reasoningEffort := extractOpenAIReasoningEffortFromBody(patchedBody, originalModel)
 	return &OpenAIForwardResult{
 		RequestID:       firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
 		ResponseID:      responseID,
@@ -1073,7 +1112,8 @@ func buildGrokResponsesRequest(ctx context.Context, c *gin.Context, account *Acc
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if account.IsGrokOAuth() {
+	webSearchHelper := isGrokCLIWebSearchHelperBody(body)
+	if account.IsGrokOAuth() && !webSearchHelper {
 		applyGrokCLIHeaders(req.Header)
 	}
 	applyGrokCacheHeaders(req.Header, cacheIdentity)
@@ -1082,10 +1122,59 @@ func buildGrokResponsesRequest(ctx context.Context, c *gin.Context, account *Acc
 			req.Header.Set("OpenAI-Beta", v)
 		}
 	}
-	// 账号级请求头覆写最后应用，使配置值优先于上面的内置默认头；
-	// 打到官方 CLI 网关时身份头仍由共享传输层最终强制。
+	// 账号级覆写先应用；Web Search helper 的官方最小身份随后收敛，
+	// 共享传输层会消费内部 marker，确保它不会发给上游。
 	account.ApplyHeaderOverrides(req.Header)
+	if account.IsGrokOAuth() && webSearchHelper {
+		applyGrokWebSearchHelperHeaders(req.Header, c)
+		req.Header.Set(grokWebSearchHelperMarkerHeader, "true")
+	} else if account.IsGrokOAuth() {
+		applyGrokCLIModelOverride(req.Header, gjson.GetBytes(body, "model").String())
+	}
 	return req, nil
+}
+
+func isGrokCLIWebSearchHelperBody(body []byte) bool {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	toolList := tools.Array()
+	if len(toolList) != 1 || toolList[0].Get("type").String() != "web_search" {
+		return false
+	}
+	input := gjson.GetBytes(body, "input")
+	store := gjson.GetBytes(body, "store")
+	temperature := gjson.GetBytes(body, "temperature")
+	topP := gjson.GetBytes(body, "top_p")
+	maxOutputTokens := gjson.GetBytes(body, "max_output_tokens")
+	stream := gjson.GetBytes(body, "stream")
+	return input.Type == gjson.String &&
+		store.Raw == "false" &&
+		temperature.Type == gjson.Number && temperature.Float() == 0.1 &&
+		topP.Type == gjson.Number && topP.Float() == 0.95 &&
+		maxOutputTokens.Int() == 8192 &&
+		(!stream.Exists() || !stream.Bool())
+}
+
+func applyGrokWebSearchHelperHeaders(headers http.Header, c *gin.Context) {
+	if headers == nil {
+		return
+	}
+	mode := "interactive"
+	if c != nil {
+		candidate := strings.ToLower(strings.TrimSpace(c.GetHeader("X-Grok-Client-Mode")))
+		if candidate == "interactive" || candidate == "headless" {
+			mode = candidate
+		}
+	}
+	headers.Set("X-XAI-Token-Auth", "xai-grok-cli")
+	headers.Set("X-AuthenticateResponse", "authenticate-response")
+	headers.Set("X-Grok-Client-Mode", mode)
+	headers.Del("X-Grok-Client-Version")
+	headers.Del("X-Grok-Client-Identifier")
+	headers.Del("X-Grok-Model-Override")
+	headers.Del("User-Agent")
 }
 
 // applyGrokCLIHeaders identifies subscription traffic as a supported Grok CLI
@@ -1097,6 +1186,21 @@ func applyGrokCLIHeaders(headers http.Header) {
 	headers.Set("User-Agent", grokUpstreamUserAgent)
 	headers.Set("X-Grok-Client-Version", grokCLIVersion)
 	headers.Set("X-Grok-Client-Mode", "interactive")
+}
+
+// applyGrokCLIModelOverride preserves the official Grok CLI OAuth routing
+// contract. cli-chat-proxy selects the backend from this header rather than
+// from the JSON model field alone.
+func applyGrokCLIModelOverride(headers http.Header, model string) {
+	if headers == nil {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		headers.Del("X-Grok-Model-Override")
+		return
+	}
+	headers.Set("X-Grok-Model-Override", model)
 }
 
 func (s *OpenAIGatewayService) updateGrokUsageSnapshot(ctx context.Context, account *Account, snapshot *xai.QuotaSnapshot) {

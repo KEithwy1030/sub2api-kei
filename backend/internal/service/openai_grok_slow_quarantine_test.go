@@ -112,6 +112,30 @@ func TestEvaluateGrokSlowTTFTQuarantineIsGroupAndPlatformScoped(t *testing.T) {
 	}
 }
 
+func TestGrokSlowTTFTStickyAffinityBypassesOnlySlowQuarantine(t *testing.T) {
+	resetAt := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	account := &Account{
+		Platform:    PlatformGrok,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra: map[string]any{
+			modelRateLimitsKey: map[string]any{
+				"grok-4.5": map[string]any{
+					"rate_limit_reset_at": resetAt,
+					"reason":              "grok slow ttft quarantine: 25000ms (2 consecutive)",
+				},
+			},
+		},
+	}
+	stickyCtx := withGrokSlowTTFTStickyAffinity(context.Background(), account)
+
+	require.True(t, shouldClearStickySession(account, "grok-4.5"), "new sessions must treat slow quarantine as blocked")
+	require.False(t, shouldClearStickySessionWithContext(stickyCtx, account, "grok-4.5"), "existing sticky sessions must preserve cache affinity")
+
+	account.Extra[modelRateLimitsKey].(map[string]any)["grok-4.5"].(map[string]any)["reason"] = "upstream 429 rate limit"
+	require.True(t, shouldClearStickySessionWithContext(stickyCtx, account, "grok-4.5"), "real upstream rate limits must still break affinity")
+}
+
 func TestEvaluateGrokSlowTTFTQuarantineMapsRequestedModelOnce(t *testing.T) {
 	repo := &grokSlowQuarantineAccountRepo{calls: make(chan grokSlowQuarantineModelLimitCall, 1)}
 	cfg := &config.Config{}
@@ -243,11 +267,46 @@ func TestScheduledRecoveryPreservesActiveGrokSlowTTFTQuarantine(t *testing.T) {
 	require.True(t, repo.selectiveClearCalled)
 }
 
+func TestFastProbeRecoveryClearsDurableAndRuntimeGrokSlowTTFTQuarantine(t *testing.T) {
+	resetAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	account := &Account{
+		ID:       43,
+		Status:   StatusActive,
+		Platform: PlatformGrok,
+		Type:     AccountTypeOAuth,
+		Extra: map[string]any{
+			modelRateLimitsKey: map[string]any{
+				"grok-4.5": map[string]any{
+					"rate_limit_reset_at": resetAt,
+					"reason":              "grok slow ttft quarantine: 25000ms (2 consecutive)",
+				},
+			},
+		},
+	}
+	repo := &grokSlowRecoveryAccountRepo{account: account}
+	gateway := &OpenAIGatewayService{}
+	key := openAIAccountModelKey{AccountID: account.ID, Model: "grok-4.5"}
+	gateway.grokSlowTTFTQuarantineUntil.Store(key, time.Now().Add(24*time.Hour))
+	gateway.grokSlowTTFTQuarantineStats.Store(key, &grokSlowTTFTQuarantineStat{until: time.Now().Add(24 * time.Hour)})
+	svc := &RateLimitService{accountRepo: repo, runtimeBlocker: gateway}
+
+	cleared, err := svc.RecoverGrokSlowTTFTAfterFastProbe(context.Background(), account.ID)
+
+	require.NoError(t, err)
+	require.True(t, cleared)
+	require.True(t, repo.probeClearCalled)
+	_, runtimeBlocked := gateway.grokSlowTTFTQuarantineUntil.Load(key)
+	require.False(t, runtimeBlocked)
+	_, statsRemain := gateway.grokSlowTTFTQuarantineStats.Load(key)
+	require.False(t, statsRemain)
+}
+
 type grokSlowRecoveryAccountRepo struct {
 	AccountRepository
 	account              *Account
 	clearRateLimitCalled bool
 	selectiveClearCalled bool
+	probeClearCalled     bool
 }
 
 func (r *grokSlowRecoveryAccountRepo) GetByID(_ context.Context, _ int64) (*Account, error) {
@@ -273,4 +332,12 @@ func (r *grokSlowRecoveryAccountRepo) ClearModelRateLimitsExceptActiveReasonPref
 		return fmt.Errorf("unexpected reason prefix: %s", prefix)
 	}
 	return nil
+}
+
+func (r *grokSlowRecoveryAccountRepo) ClearModelRateLimitsByReasonPrefix(_ context.Context, _ int64, prefix string) (bool, error) {
+	r.probeClearCalled = true
+	if prefix != grokSlowTTFTQuarantineReasonPrefix {
+		return false, fmt.Errorf("unexpected reason prefix: %s", prefix)
+	}
+	return true, nil
 }

@@ -1,0 +1,364 @@
+From af2392fdd8de79c7f53e227e31e76449879881af Mon Sep 17 00:00:00 2001
+From: xiaohongshu <xiaohongshu@example.com>
+Date: Mon, 27 Jul 2026 07:48:05 +0800
+Subject: [PATCH] fix(grok): keep warm sessions on slow-quarantined accounts
+
+---
+ backend/internal/service/gateway_service.go   |  6 +-
+ backend/internal/service/model_rate_limit.go  |  6 ++
+ .../openai_account_runtime_block_fastpath.go  | 10 +++-
+ .../service/openai_account_scheduler.go       |  9 +--
+ .../service/openai_account_scheduler_test.go  | 58 +++++++++++++++++++
+ .../service/openai_gateway_scheduling.go      | 20 ++++---
+ .../service/openai_grok_slow_quarantine.go    | 45 +++++++++++---
+ .../openai_grok_slow_quarantine_test.go       | 24 ++++++++
+ 8 files changed, 156 insertions(+), 22 deletions(-)
+
+diff --git a/backend/internal/service/gateway_service.go b/backend/internal/service/gateway_service.go
+index 2f2f836d..1f558484 100644
+--- a/backend/internal/service/gateway_service.go
++++ b/backend/internal/service/gateway_service.go
+@@ -513,13 +513,17 @@ func prefetchedStickyAccountIDFromContext(ctx context.Context, groupID *int64) i
+ // and the sticky session binding should be cleared.
+ // Delegates to IsSchedulable() for account-level checks, plus model-level rate limiting.
+ func shouldClearStickySession(account *Account, requestedModel string) bool {
++	return shouldClearStickySessionWithContext(context.Background(), account, requestedModel)
++}
++
++func shouldClearStickySessionWithContext(ctx context.Context, account *Account, requestedModel string) bool {
+ 	if account == nil {
+ 		return false
+ 	}
+ 	if !account.IsSchedulable() {
+ 		return true
+ 	}
+-	if remaining := account.GetRateLimitRemainingTimeWithContext(context.Background(), requestedModel); remaining > 0 {
++	if remaining := account.GetRateLimitRemainingTimeWithContext(ctx, requestedModel); remaining > 0 {
+ 		return true
+ 	}
+ 	return false
+diff --git a/backend/internal/service/model_rate_limit.go b/backend/internal/service/model_rate_limit.go
+index 195f5a1d..7dfa4729 100644
+--- a/backend/internal/service/model_rate_limit.go
++++ b/backend/internal/service/model_rate_limit.go
+@@ -38,6 +38,9 @@ func (a *Account) getRateLimitRemainingForKey(key string) time.Duration {
+ 
+ func (a *Account) isModelRateLimitedWithContext(ctx context.Context, requestedModel string) bool {
+ 	for _, key := range a.modelRateLimitKeysForRequest(ctx, requestedModel) {
++		if preserveGrokSlowTTFTStickyAffinity(ctx) && isActiveGrokSlowTTFTModelRateLimitKey(a, key, time.Now()) {
++			continue
++		}
+ 		if a.isRateLimitActiveForKey(key) {
+ 			return true
+ 		}
+@@ -54,6 +57,9 @@ func (a *Account) GetModelRateLimitRemainingTime(requestedModel string) time.Dur
+ func (a *Account) GetModelRateLimitRemainingTimeWithContext(ctx context.Context, requestedModel string) time.Duration {
+ 	remaining := time.Duration(0)
+ 	for _, key := range a.modelRateLimitKeysForRequest(ctx, requestedModel) {
++		if preserveGrokSlowTTFTStickyAffinity(ctx) && isActiveGrokSlowTTFTModelRateLimitKey(a, key, time.Now()) {
++			continue
++		}
+ 		if keyRemaining := a.getRateLimitRemainingForKey(key); keyRemaining > remaining {
+ 			remaining = keyRemaining
+ 		}
+diff --git a/backend/internal/service/openai_account_runtime_block_fastpath.go b/backend/internal/service/openai_account_runtime_block_fastpath.go
+index d2ddc2e8..ffb8b6b0 100644
+--- a/backend/internal/service/openai_account_runtime_block_fastpath.go
++++ b/backend/internal/service/openai_account_runtime_block_fastpath.go
+@@ -306,9 +306,17 @@ func (s *OpenAIGatewayService) isOpenAIAccountModelRuntimeBlocked(account *Accou
+ }
+ 
+ func (s *OpenAIGatewayService) isOpenAIAccountRequestRuntimeBlocked(account *Account, requestedModel string) bool {
++	return s.isOpenAIAccountRequestRuntimeBlockedWithContext(context.Background(), account, requestedModel)
++}
++
++func (s *OpenAIGatewayService) isOpenAIAccountRequestRuntimeBlockedWithContext(ctx context.Context, account *Account, requestedModel string) bool {
++	slowTTFTBlocked := s != nil && s.isGrokSlowTTFTQuarantined(account, requestedModel)
++	if slowTTFTBlocked && preserveGrokSlowTTFTStickyAffinity(ctx) {
++		slowTTFTBlocked = false
++	}
+ 	return s != nil && (s.isOpenAIAccountRuntimeBlocked(account) ||
+ 		s.isOpenAIAccountModelRuntimeBlocked(account, requestedModel) ||
+-		s.isGrokSlowTTFTQuarantined(account, requestedModel))
++		slowTTFTBlocked)
+ }
+ 
+ func (s *OpenAIGatewayService) recordOpenAIOAuth429() {
+diff --git a/backend/internal/service/openai_account_scheduler.go b/backend/internal/service/openai_account_scheduler.go
+index 5b340c64..c64269f4 100644
+--- a/backend/internal/service/openai_account_scheduler.go
++++ b/backend/internal/service/openai_account_scheduler.go
+@@ -494,18 +494,19 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
+ 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
+ 		return nil, false, nil
+ 	}
+-	if shouldClearStickySession(account, req.RequestedModel) || account.Platform != normalizeOpenAICompatiblePlatform(req.Platform) || !account.IsOpenAICompatible() || !account.IsSchedulable() {
++	stickyCtx := withGrokSlowTTFTStickyAffinity(ctx, account)
++	if shouldClearStickySessionWithContext(stickyCtx, account, req.RequestedModel) || account.Platform != normalizeOpenAICompatiblePlatform(req.Platform) || !account.IsOpenAICompatible() || !account.IsSchedulable() {
+ 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
+ 		return nil, false, nil
+ 	}
+-	if !s.isAccountRequestCompatible(ctx, account, req) {
++	if !s.isAccountRequestCompatible(stickyCtx, account, req) {
+ 		return nil, false, nil
+ 	}
+ 	if !s.isAccountTransportCompatible(account, req.RequiredTransport) {
+ 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
+ 		return nil, false, nil
+ 	}
+-	account = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
++	account = s.service.recheckSelectedOpenAIAccountFromDB(stickyCtx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
+ 	if account == nil || !s.service.openAIAccountMatchesSchedulingGroup(account, req.GroupID) || !s.isAccountTransportCompatible(account, req.RequiredTransport) {
+ 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
+ 		return nil, false, nil
+@@ -1693,7 +1694,7 @@ func (s *defaultOpenAIAccountScheduler) isAccountRequestCompatibleReason(ctx con
+ 	if account == nil {
+ 		return false, "account_nil"
+ 	}
+-	if s != nil && s.service != nil && s.service.isOpenAIAccountRequestRuntimeBlocked(account, req.RequestedModel) {
++	if s != nil && s.service != nil && s.service.isOpenAIAccountRequestRuntimeBlockedWithContext(ctx, account, req.RequestedModel) {
+ 		return false, "runtime_blocked"
+ 	}
+ 	if s != nil && s.service != nil && s.service.isOpenAIProxyStreamQuarantined(account) {
+diff --git a/backend/internal/service/openai_account_scheduler_test.go b/backend/internal/service/openai_account_scheduler_test.go
+index 92003d8e..1692ad5d 100644
+--- a/backend/internal/service/openai_account_scheduler_test.go
++++ b/backend/internal/service/openai_account_scheduler_test.go
+@@ -2314,6 +2314,64 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_GrokStickyPreservesCach
+ 	}
+ }
+ 
++func TestOpenAIGatewayService_SelectAccountWithScheduler_GrokSlowQuarantineOnlyBlocksNewSessions(t *testing.T) {
++	ctx := context.Background()
++	groupID := int64(10106)
++	resetAt := time.Now().Add(24 * time.Hour)
++	accounts := []Account{
++		{
++			ID:          21611,
++			Platform:    PlatformGrok,
++			Type:        AccountTypeOAuth,
++			Status:      StatusActive,
++			Schedulable: true,
++			Concurrency: 1,
++			Priority:    0,
++			GroupIDs:    []int64{groupID},
++			Extra: map[string]any{
++				modelRateLimitsKey: map[string]any{
++					"grok-4.5": map[string]any{
++						"rate_limit_reset_at": resetAt.UTC().Format(time.RFC3339),
++						"reason":              "grok slow ttft quarantine: 25000ms (2 consecutive)",
++					},
++				},
++			},
++		},
++		{ID: 21612, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 1, GroupIDs: []int64{groupID}},
++	}
++	cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{"openai:session_hash_grok_slow_sticky": 21611}}
++	svc := &OpenAIGatewayService{
++		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: accounts},
++		cache:              cache,
++		cfg:                &config.Config{},
++		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("true"),
++		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{acquireResults: map[int64]bool{21611: true, 21612: true}}),
++		openaiAccountStats: newOpenAIAccountRuntimeStats(),
++	}
++	svc.grokSlowTTFTQuarantineUntil.Store(openAIAccountModelKey{AccountID: 21611, Model: "grok-4.5"}, resetAt)
++
++	selection, decision, err := svc.SelectAccountWithSchedulerForCapability(ctx, &groupID, "", "session_hash_grok_slow_sticky", "grok-4.5", nil, OpenAIUpstreamTransportAny, "", false, false, false, PlatformGrok)
++	require.NoError(t, err)
++	require.NotNil(t, selection)
++	require.Equal(t, int64(21611), selection.Account.ID, "an existing warm session must stay on its slow-quarantined account")
++	require.Equal(t, openAIAccountScheduleLayerSessionSticky, decision.Layer)
++	require.True(t, decision.StickySessionHit)
++	require.Equal(t, int64(21611), cache.sessionBindings["openai:session_hash_grok_slow_sticky"])
++	if selection.ReleaseFunc != nil {
++		selection.ReleaseFunc()
++	}
++
++	selection, decision, err = svc.SelectAccountWithSchedulerForCapability(ctx, &groupID, "", "session_hash_grok_slow_new", "grok-4.5", nil, OpenAIUpstreamTransportAny, "", false, false, false, PlatformGrok)
++	require.NoError(t, err)
++	require.NotNil(t, selection)
++	require.Equal(t, int64(21612), selection.Account.ID, "a new session must skip the slow-quarantined account")
++	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
++	require.False(t, decision.StickySessionHit)
++	if selection.ReleaseFunc != nil {
++		selection.ReleaseFunc()
++	}
++}
++
+ func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyEscapeByErrorRate(t *testing.T) {
+ 	ctx := context.Background()
+ 	groupID := int64(10102)
+diff --git a/backend/internal/service/openai_gateway_scheduling.go b/backend/internal/service/openai_gateway_scheduling.go
+index 01316cb5..5a31c876 100644
+--- a/backend/internal/service/openai_gateway_scheduling.go
++++ b/backend/internal/service/openai_gateway_scheduling.go
+@@ -702,28 +702,29 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID
+ 	if err != nil {
+ 		return nil
+ 	}
++	stickyCtx := withGrokSlowTTFTStickyAffinity(ctx, account)
+ 
+ 	// 检查账号是否需要清理粘性会话
+ 	// Check if sticky session should be cleared
+-	if shouldClearStickySession(account, requestedModel) {
++	if shouldClearStickySessionWithContext(stickyCtx, account, requestedModel) {
+ 		_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+ 		return nil
+ 	}
+ 
+ 	// 验证账号是否可用于当前请求
+ 	// Verify account is usable for current request
+-	if !isOpenAICompatibleAccountEligibleForRequest(ctx, account, platform, requestedModel, false, requiredCapability) {
++	if !isOpenAICompatibleAccountEligibleForRequest(stickyCtx, account, platform, requestedModel, false, requiredCapability) {
+ 		return nil
+ 	}
+ 	if !parentHealthyForShadow(account, s.parentAccountLookup(ctx)) {
+ 		_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+ 		return nil
+ 	}
+-	if s.isOpenAIAccountRequestRuntimeBlocked(account, requestedModel) {
++	if s.isOpenAIAccountRequestRuntimeBlockedWithContext(stickyCtx, account, requestedModel) {
+ 		_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+ 		return nil
+ 	}
+-	account = s.recheckSelectedOpenAIAccountFromDB(ctx, account, groupID, platform, requestedModel, requireCompact, requiredCapability)
++	account = s.recheckSelectedOpenAIAccountFromDB(stickyCtx, account, groupID, platform, requestedModel, requireCompact, requiredCapability)
+ 	if account == nil || !s.openAIAccountMatchesSchedulingGroup(account, groupID) {
+ 		_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+ 		return nil
+@@ -913,17 +914,18 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
+ 		if accountID > 0 && !isExcluded(accountID) {
+ 			account, err := s.getSchedulableAccount(ctx, accountID)
+ 			if err == nil {
+-				clearSticky := shouldClearStickySession(account, requestedModel)
++				stickyCtx := withGrokSlowTTFTStickyAffinity(ctx, account)
++				clearSticky := shouldClearStickySessionWithContext(stickyCtx, account, requestedModel)
+ 				if clearSticky {
+ 					_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+ 				}
+-				if !clearSticky && isOpenAICompatibleAccountEligibleForRequest(ctx, account, platform, requestedModel, false, requiredCapability) {
+-					account = s.recheckSelectedOpenAIAccountFromDB(ctx, account, groupID, platform, requestedModel, requireCompact, requiredCapability)
++				if !clearSticky && isOpenAICompatibleAccountEligibleForRequest(stickyCtx, account, platform, requestedModel, false, requiredCapability) {
++					account = s.recheckSelectedOpenAIAccountFromDB(stickyCtx, account, groupID, platform, requestedModel, requireCompact, requiredCapability)
+ 					if account == nil {
+ 						_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+ 					} else if !s.openAIAccountMatchesSchedulingGroup(account, groupID) {
+ 						_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+-					} else if s.isOpenAIAccountRequestRuntimeBlocked(account, requestedModel) {
++					} else if s.isOpenAIAccountRequestRuntimeBlockedWithContext(stickyCtx, account, requestedModel) {
+ 						_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+ 					} else if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, account, requestedModel, requireCompact) {
+ 						_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+@@ -1294,7 +1296,7 @@ func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDB(ctx context.Co
+ 	if !parentHealthyForShadow(latest, s.parentAccountLookup(ctx)) {
+ 		return nil
+ 	}
+-	if s.isOpenAIAccountRequestRuntimeBlocked(latest, requestedModel) {
++	if s.isOpenAIAccountRequestRuntimeBlockedWithContext(ctx, latest, requestedModel) {
+ 		return nil
+ 	}
+ 	if s.isOpenAIProxyStreamQuarantined(latest) {
+diff --git a/backend/internal/service/openai_grok_slow_quarantine.go b/backend/internal/service/openai_grok_slow_quarantine.go
+index 1a8072cd..699f20c8 100644
+--- a/backend/internal/service/openai_grok_slow_quarantine.go
++++ b/backend/internal/service/openai_grok_slow_quarantine.go
+@@ -11,6 +11,26 @@ import (
+ 
+ const grokSlowTTFTQuarantineReasonPrefix = "grok slow ttft quarantine:"
+ 
++type grokSlowTTFTStickyAffinityContextKey struct{}
++
++func withGrokSlowTTFTStickyAffinity(ctx context.Context, account *Account) context.Context {
++	if account == nil || account.Platform != PlatformGrok {
++		return ctx
++	}
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	return context.WithValue(ctx, grokSlowTTFTStickyAffinityContextKey{}, true)
++}
++
++func preserveGrokSlowTTFTStickyAffinity(ctx context.Context) bool {
++	if ctx == nil {
++		return false
++	}
++	preserve, _ := ctx.Value(grokSlowTTFTStickyAffinityContextKey{}).(bool)
++	return preserve
++}
++
+ type grokSlowTTFTQuarantineStat struct {
+ 	mu          sync.Mutex
+ 	consecutive int
+@@ -215,15 +235,26 @@ func isActiveGrokSlowTTFTModelRateLimit(account *Account, now time.Time) bool {
+ 	if !ok {
+ 		return false
+ 	}
+-	for _, rawLimit := range rawLimits {
+-		limit, ok := rawLimit.(map[string]any)
+-		if !ok || !strings.HasPrefix(strings.TrimSpace(anyString(limit["reason"])), grokSlowTTFTQuarantineReasonPrefix) {
+-			continue
+-		}
+-		resetAt, err := time.Parse(time.RFC3339, strings.TrimSpace(anyString(limit["rate_limit_reset_at"])))
+-		if err == nil && now.Before(resetAt) {
++	for key := range rawLimits {
++		if isActiveGrokSlowTTFTModelRateLimitKey(account, key, now) {
+ 			return true
+ 		}
+ 	}
+ 	return false
+ }
++
++func isActiveGrokSlowTTFTModelRateLimitKey(account *Account, key string, now time.Time) bool {
++	if account == nil || account.Platform != PlatformGrok || account.Extra == nil || strings.TrimSpace(key) == "" {
++		return false
++	}
++	rawLimits, ok := account.Extra[modelRateLimitsKey].(map[string]any)
++	if !ok {
++		return false
++	}
++	limit, ok := rawLimits[key].(map[string]any)
++	if !ok || !strings.HasPrefix(strings.TrimSpace(anyString(limit["reason"])), grokSlowTTFTQuarantineReasonPrefix) {
++		return false
++	}
++	resetAt, err := time.Parse(time.RFC3339, strings.TrimSpace(anyString(limit["rate_limit_reset_at"])))
++	return err == nil && now.Before(resetAt)
++}
+diff --git a/backend/internal/service/openai_grok_slow_quarantine_test.go b/backend/internal/service/openai_grok_slow_quarantine_test.go
+index fb668fc9..b20eb7ec 100644
+--- a/backend/internal/service/openai_grok_slow_quarantine_test.go
++++ b/backend/internal/service/openai_grok_slow_quarantine_test.go
+@@ -112,6 +112,30 @@ func TestEvaluateGrokSlowTTFTQuarantineIsGroupAndPlatformScoped(t *testing.T) {
+ 	}
+ }
+ 
++func TestGrokSlowTTFTStickyAffinityBypassesOnlySlowQuarantine(t *testing.T) {
++	resetAt := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
++	account := &Account{
++		Platform:    PlatformGrok,
++		Status:      StatusActive,
++		Schedulable: true,
++		Extra: map[string]any{
++			modelRateLimitsKey: map[string]any{
++				"grok-4.5": map[string]any{
++					"rate_limit_reset_at": resetAt,
++					"reason":              "grok slow ttft quarantine: 25000ms (2 consecutive)",
++				},
++			},
++		},
++	}
++	stickyCtx := withGrokSlowTTFTStickyAffinity(context.Background(), account)
++
++	require.True(t, shouldClearStickySession(account, "grok-4.5"), "new sessions must treat slow quarantine as blocked")
++	require.False(t, shouldClearStickySessionWithContext(stickyCtx, account, "grok-4.5"), "existing sticky sessions must preserve cache affinity")
++
++	account.Extra[modelRateLimitsKey].(map[string]any)["grok-4.5"].(map[string]any)["reason"] = "upstream 429 rate limit"
++	require.True(t, shouldClearStickySessionWithContext(stickyCtx, account, "grok-4.5"), "real upstream rate limits must still break affinity")
++}
++
+ func TestEvaluateGrokSlowTTFTQuarantineMapsRequestedModelOnce(t *testing.T) {
+ 	repo := &grokSlowQuarantineAccountRepo{calls: make(chan grokSlowQuarantineModelLimitCall, 1)}
+ 	cfg := &config.Config{}
+-- 
+2.53.0.windows.1
+

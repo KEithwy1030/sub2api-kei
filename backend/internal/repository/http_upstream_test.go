@@ -268,6 +268,7 @@ func TestHTTPUpstreamDoFallsBackToOfficialGrokAPIOnCLIAccessDenied(t *testing.T)
 			if calls == 1 {
 				require.Equal(t, grokCLIProxyHost, req.URL.Hostname())
 				require.Equal(t, "xai-grok-cli", req.Header.Get("X-XAI-Token-Auth"))
+				require.Equal(t, "grok-4.5", req.Header.Get("X-Grok-Model-Override"))
 				return &http.Response{
 					StatusCode: http.StatusForbidden,
 					Header:     make(http.Header),
@@ -295,6 +296,7 @@ func TestHTTPUpstreamDoFallsBackToOfficialGrokAPIOnCLIAccessDenied(t *testing.T)
 	req, err := http.NewRequest(http.MethodPost, "https://cli-chat-proxy.grok.com/v1/responses", bytes.NewReader(payload))
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer oauth-token")
+	req.Header.Set("X-Grok-Model-Override", "grok-4.5")
 
 	resp, err := svc.Do(req, "", accountID, 1)
 	require.NoError(t, err)
@@ -307,6 +309,7 @@ func TestHTTPUpstreamDoFallsBackToOfficialGrokAPIOnCLIAccessDenied(t *testing.T)
 	require.Equal(t, payload, fallbackBody)
 	require.Equal(t, "Bearer oauth-token", fallbackHeaders.Get("Authorization"))
 	require.Empty(t, fallbackHeaders.Get("X-XAI-Token-Auth"))
+	require.Empty(t, fallbackHeaders.Get("X-Grok-Model-Override"))
 	require.Empty(t, fallbackHeaders.Get("x-grok-client-version"))
 	require.Empty(t, fallbackHeaders.Get("User-Agent"))
 }
@@ -455,6 +458,26 @@ func TestHTTPUpstreamDoDoesNotFallbackForGrokEntitlementDenial(t *testing.T) {
 }
 
 func TestApplyGrokCLIProxyHeaders(t *testing.T) {
+	t.Run("uses the official minimal identity for the web search helper", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodPost, "https://cli-chat-proxy.grok.com/v1/responses", nil)
+		require.NoError(t, err)
+		req.Header.Set(grokWebSearchHelperHeader, "true")
+		req.Header.Set("X-Grok-Client-Mode", "headless")
+		req.Header.Set("X-Grok-Client-Version", "0.2.93")
+		req.Header.Set("X-Grok-Client-Identifier", "grok-shell")
+		req.Header.Set("User-Agent", "xai-grok-workspace/0.2.93")
+
+		applyGrokCLIProxyHeaders(req)
+
+		require.Empty(t, req.Header.Get(grokWebSearchHelperHeader))
+		require.Equal(t, "xai-grok-cli", req.Header.Get("X-XAI-Token-Auth"))
+		require.Equal(t, "authenticate-response", req.Header.Get("X-AuthenticateResponse"))
+		require.Equal(t, "headless", req.Header.Get("X-Grok-Client-Mode"))
+		require.Equal(t, "0.2.118", req.Header.Get("X-Grok-Client-Version"))
+		require.Empty(t, req.Header.Get("X-Grok-Client-Identifier"))
+		require.Empty(t, req.Header.Get("User-Agent"))
+	})
+
 	t.Run("uses pinned stable version for the CLI proxy", func(t *testing.T) {
 		t.Setenv("XAI_GROK_CLI_VERSION", "")
 		req, err := http.NewRequest(http.MethodPost, "https://cli-chat-proxy.grok.com/v1/responses", nil)

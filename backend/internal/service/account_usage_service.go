@@ -1,10 +1,12 @@
 package service
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"math/rand/v2"
@@ -590,20 +592,33 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 			// via the shared OpenAIQuotaService, which resolves credentials from the
 			// parent account.  The result is written to the shadow row's own codex_*
 			// Extra keys and immediately reflected in the returned UsageInfo.
-			if s.openAIQuotaService != nil {
-				if quotaUsage, err := s.openAIQuotaService.QueryUsage(ctx, account.ID); err == nil {
-					if updates := buildCodexSparkWindowExtraUpdates(quotaUsage, now); len(updates) > 0 {
-						mergeAccountExtra(account, updates)
-						s.persistOpenAICodexProbeSnapshot(account.ID, updates)
-						if usage.UpdatedAt == nil {
-							usage.UpdatedAt = &now
-						}
-						applyExtraToUsage(usage, account.Extra, now)
-					}
+			if s.openAIQuotaService == nil {
+				if force {
+					return nil, fmt.Errorf("openai quota service is not enabled")
 				}
+			} else if quotaUsage, queryErr := s.openAIQuotaService.QueryUsage(ctx, account.ID); queryErr != nil {
+				s.clearOpenAICodexProbeAttempt(account.ID)
+				if force {
+					return nil, fmt.Errorf("query openai spark quota: %w", queryErr)
+				}
+				slog.Warn("openai_spark_quota_refresh_failed", "account_id", account.ID, "error", queryErr)
+			} else if updates := buildCodexSparkWindowExtraUpdates(quotaUsage, now); len(updates) > 0 {
+				mergeAccountExtra(account, updates)
+				s.persistOpenAICodexProbeSnapshot(account.ID, updates)
+				if usage.UpdatedAt == nil {
+					usage.UpdatedAt = &now
+				}
+				applyExtraToUsage(usage, account.Extra, now)
 			}
 		} else {
-			if updates, err := s.probeOpenAICodexSnapshot(ctx, account); err == nil && len(updates) > 0 {
+			updates, probeErr := s.probeOpenAICodexSnapshot(ctx, account)
+			if probeErr != nil {
+				s.clearOpenAICodexProbeAttempt(account.ID)
+				if force {
+					return nil, probeErr
+				}
+				slog.Warn("openai_codex_usage_probe_failed", "account_id", account.ID, "error", probeErr)
+			} else if len(updates) > 0 {
 				mergeAccountExtra(account, updates)
 				if usage.UpdatedAt == nil {
 					usage.UpdatedAt = &now
@@ -632,6 +647,13 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 	}
 
 	return usage, nil
+}
+
+func (s *AccountUsageService) clearOpenAICodexProbeAttempt(accountID int64) {
+	if s == nil || s.cache == nil || accountID <= 0 {
+		return
+	}
+	s.cache.openAIProbeCache.Delete(accountID)
 }
 
 func shouldRefreshOpenAICodexSnapshot(account *Account, usage *UsageInfo, now time.Time) bool {
@@ -709,7 +731,7 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 		return nil, fmt.Errorf("marshal openai probe payload: %w", err)
 	}
 
-	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, chatgptCodexURL, bytes.NewReader(payloadBytes))
 	if err != nil {
@@ -751,7 +773,7 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 	}
 	client, err := httppool.GetClient(httppool.Options{
 		ProxyURL:              proxyURL,
-		Timeout:               15 * time.Second,
+		Timeout:               20 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
 	})
 	if err != nil {
@@ -763,15 +785,99 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	updates, err := extractOpenAICodexProbeUpdates(resp)
-	if err != nil {
-		return nil, err
-	}
-	if len(updates) > 0 {
-		s.persistOpenAICodexProbeSnapshot(account.ID, updates)
+	// A limited account can still return useful quota headers even though it
+	// cannot complete the inference. Preserve that existing behavior.
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		updates, extractErr := extractOpenAICodexProbeUpdates(resp)
+		if extractErr != nil {
+			return nil, extractErr
+		}
+		if len(updates) == 0 {
+			return nil, fmt.Errorf("openai codex probe returned status %d", resp.StatusCode)
+		}
+		if err := s.accountRepo.UpdateExtra(ctx, account.ID, updates); err != nil {
+			return nil, fmt.Errorf("persist openai codex quota snapshot: %w", err)
+		}
 		return updates, nil
 	}
-	return nil, nil
+
+	if err := consumeOpenAICodexProbeStream(resp.Body); err != nil {
+		return nil, err
+	}
+
+	// Response headers describe admission-time state. Query /wham/usage only
+	// after response.completed so the returned window includes this real call.
+	if s.openAIQuotaService == nil {
+		return nil, fmt.Errorf("openai quota service is not enabled")
+	}
+	quotaUsage, err := s.openAIQuotaService.QueryUsage(ctx, account.ID)
+	if err != nil {
+		return nil, fmt.Errorf("refresh settled openai quota: %w", err)
+	}
+	updates := buildCodexRateLimitWindowExtraUpdates(quotaUsage.RateLimit, time.Now())
+	if len(updates) == 0 {
+		return nil, fmt.Errorf("settled openai quota response contained no active windows")
+	}
+	if err := s.accountRepo.UpdateExtra(ctx, account.ID, updates); err != nil {
+		return nil, fmt.Errorf("persist settled openai quota snapshot: %w", err)
+	}
+	return updates, nil
+}
+
+func consumeOpenAICodexProbeStream(body io.Reader) error {
+	if body == nil {
+		return fmt.Errorf("openai codex probe returned an empty stream")
+	}
+
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" {
+			continue
+		}
+		if payload == "[DONE]" {
+			return fmt.Errorf("openai codex probe ended before response.completed")
+		}
+
+		var event struct {
+			Type     string `json:"type"`
+			Response struct {
+				Error *struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			} `json:"response"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			continue
+		}
+
+		switch event.Type {
+		case "response.completed", "response.done":
+			return nil
+		case "response.failed":
+			if event.Response.Error != nil && strings.TrimSpace(event.Response.Error.Message) != "" {
+				return fmt.Errorf("openai codex probe failed: %s", strings.TrimSpace(event.Response.Error.Message))
+			}
+			return fmt.Errorf("openai codex probe failed")
+		case "error":
+			if event.Error != nil && strings.TrimSpace(event.Error.Message) != "" {
+				return fmt.Errorf("openai codex probe failed: %s", strings.TrimSpace(event.Error.Message))
+			}
+			return fmt.Errorf("openai codex probe failed")
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read openai codex probe stream: %w", err)
+	}
+	return fmt.Errorf("openai codex probe stream ended before response.completed")
 }
 
 func (s *AccountUsageService) persistOpenAICodexProbeSnapshot(accountID int64, updates map[string]any) {
