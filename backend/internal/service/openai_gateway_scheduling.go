@@ -6,6 +6,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -1222,33 +1223,65 @@ func (s *OpenAIGatewayService) tryAcquireAccountSlot(ctx context.Context, accoun
 }
 
 func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccount(ctx context.Context, account *Account, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) *Account {
+	account, _ = s.resolveFreshSchedulableOpenAIAccountWithError(ctx, account, platform, requestedModel, requireCompact, requiredCapability)
+	return account
+}
+
+func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccountWithError(ctx context.Context, account *Account, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) (*Account, error) {
 	if account == nil {
-		return nil
+		return nil, nil
 	}
 	platform = normalizeOpenAICompatiblePlatform(platform)
 
 	fresh := account
 	if s.schedulerSnapshot != nil {
 		current, err := s.getSchedulableAccount(ctx, account.ID)
-		if err != nil || current == nil {
-			return nil
+		if err != nil {
+			if errors.Is(err, ErrAccountNotFound) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("scheduler account refresh failed for account %d: %w", account.ID, err)
+		}
+		if current == nil {
+			return nil, nil
 		}
 		fresh = current
 	}
 
 	if !isOpenAICompatibleAccountEligibleForRequest(ctx, fresh, platform, requestedModel, requireCompact, requiredCapability) {
-		return nil
+		return nil, nil
 	}
-	if !parentHealthyForShadow(fresh, s.parentAccountLookup(ctx)) {
-		return nil
+	parentHealthy, err := s.parentHealthyForShadowWithError(ctx, fresh)
+	if err != nil {
+		return nil, err
+	}
+	if !parentHealthy {
+		return nil, nil
 	}
 	if s.isOpenAIAccountRequestRuntimeBlocked(fresh, requestedModel) {
-		return nil
+		return nil, nil
 	}
 	if s.isOpenAIProxyStreamQuarantined(fresh) {
-		return nil
+		return nil, nil
 	}
-	return fresh
+	return fresh, nil
+}
+
+func (s *OpenAIGatewayService) parentHealthyForShadowWithError(ctx context.Context, account *Account) (bool, error) {
+	if account == nil || !account.IsShadow() {
+		return true, nil
+	}
+	if s.accountRepo == nil {
+		return false, nil
+	}
+	parent, err := s.accountRepo.GetByID(ctx, *account.ParentAccountID)
+	if err != nil {
+		if errors.Is(err, ErrAccountNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("scheduler parent DB recheck failed for account %d: %w", account.ID, err)
+	}
+	return parentHealthyForShadow(account, func(int64) *Account { return parent }), nil
 }
 
 // parentAccountLookup 返回供 parentHealthyForShadow 使用的母账号解析闭包:经 accountRepo
@@ -1266,43 +1299,65 @@ func (s *OpenAIGatewayService) parentAccountLookup(ctx context.Context) func(int
 }
 
 func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDB(ctx context.Context, account *Account, groupID *int64, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) *Account {
+	account, _ = s.recheckSelectedOpenAIAccountFromDBWithError(ctx, account, groupID, platform, requestedModel, requireCompact, requiredCapability)
+	return account
+}
+
+// recheckSelectedOpenAIAccountFromDBWithError distinguishes an ineligible
+// account from a database dependency failure. The scheduler must never turn a
+// failed authoritative read into a misleading "no available accounts" result.
+func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDBWithError(ctx context.Context, account *Account, groupID *int64, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) (*Account, error) {
 	if account == nil {
-		return nil
+		return nil, nil
 	}
 	platform = normalizeOpenAICompatiblePlatform(platform)
 	if s.schedulerSnapshot == nil || s.accountRepo == nil {
 		if !isOpenAICompatibleAccountEligibleForRequest(ctx, account, platform, requestedModel, requireCompact, requiredCapability) {
-			return nil
+			return nil, nil
 		}
-		if !parentHealthyForShadow(account, s.parentAccountLookup(ctx)) {
-			return nil
+		parentHealthy, err := s.parentHealthyForShadowWithError(ctx, account)
+		if err != nil {
+			return nil, err
+		}
+		if !parentHealthy {
+			return nil, nil
 		}
 		if s.isOpenAIProxyStreamQuarantined(account) {
-			return nil
+			return nil, nil
 		}
-		return account
+		return account, nil
 	}
 
 	latest, err := s.accountRepo.GetByID(ctx, account.ID)
-	if err != nil || latest == nil {
-		return nil
+	if err != nil {
+		if errors.Is(err, ErrAccountNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("scheduler DB recheck failed for account %d: %w", account.ID, err)
+	}
+	if latest == nil {
+		return nil, nil
 	}
 	if !s.openAIAccountMatchesSchedulingGroup(latest, groupID) {
-		return nil
+		return nil, nil
 	}
 	if !isOpenAICompatibleAccountEligibleForRequest(ctx, latest, platform, requestedModel, requireCompact, requiredCapability) {
-		return nil
+		return nil, nil
 	}
-	if !parentHealthyForShadow(latest, s.parentAccountLookup(ctx)) {
-		return nil
+	parentHealthy, err := s.parentHealthyForShadowWithError(ctx, latest)
+	if err != nil {
+		return nil, err
+	}
+	if !parentHealthy {
+		return nil, nil
 	}
 	if s.isOpenAIAccountRequestRuntimeBlockedWithContext(ctx, latest, requestedModel) {
-		return nil
+		return nil, nil
 	}
 	if s.isOpenAIProxyStreamQuarantined(latest) {
-		return nil
+		return nil, nil
 	}
-	return latest
+	return latest, nil
 }
 
 func (s *OpenAIGatewayService) openAIAccountMatchesSchedulingGroup(account *Account, groupID *int64) bool {

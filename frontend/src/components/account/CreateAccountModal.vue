@@ -5491,7 +5491,10 @@ const handleOpenAIExchange = async (authCode: string) => {
     emit('created')
     handleClose()
   } catch (error: any) {
-    oauthClient.error.value = error.response?.data?.detail || t('admin.accounts.oauth.authFailed')
+    const requestTimedOut = error?.code === 'ECONNABORTED' || /timeout/i.test(error?.message || '')
+    oauthClient.error.value = requestTimedOut
+      ? t('admin.accounts.oauth.createTimedOut')
+      : error.response?.data?.detail || t('admin.accounts.oauth.authFailed')
     appStore.showError(oauthClient.error.value)
   } finally {
     oauthClient.loading.value = false

@@ -868,8 +868,6 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		createdAccount = account
 		// Antigravity OAuth: 新账号直接设置隐私
 		h.adminService.ForceAntigravityPrivacy(ctx, account)
-		// OpenAI OAuth: 新账号直接设置隐私
-		h.adminService.ForceOpenAIPrivacy(ctx, account)
 		return h.buildAccountResponseWithRuntime(ctx, account), nil
 	})
 	if err != nil {

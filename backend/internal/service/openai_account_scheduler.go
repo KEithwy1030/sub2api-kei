@@ -3,6 +3,7 @@ package service
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -24,6 +25,8 @@ const (
 	openAIAccountScheduleLayerLoadBalance      = "load_balance"
 	openAIAdvancedSchedulerSettingKey          = "openai_advanced_scheduler_enabled"
 )
+
+var ErrOpenAISelectionProbeBudgetExhausted = errors.New("scheduler account probe budget exhausted")
 
 const (
 	openAIAdvancedSchedulerSettingCacheTTL  = 5 * time.Second
@@ -63,6 +66,7 @@ type openAIAdvancedSchedulerRuntimeSettings struct {
 }
 
 var openAIAdvancedSchedulerSettingCache atomic.Value // *cachedOpenAIAdvancedSchedulerSetting
+var openAIGrokOverflowRotation atomic.Uint64
 var openAIAdvancedSchedulerSettingSF singleflight.Group
 
 type OpenAIAccountScheduleRequest struct {
@@ -342,6 +346,15 @@ func (b *openAISelectionProbeBudget) acquireExhausted() bool {
 	return b != nil && b.limited && b.acquires >= openAIAccountSelectionProbeLimit
 }
 
+func openAISelectionProbeBudgetError(budget *openAISelectionProbeBudget, candidates int) error {
+	acquires, rechecks := 0, 0
+	if budget != nil {
+		acquires = budget.acquires
+		rechecks = budget.rechecks
+	}
+	return fmt.Errorf("%w: candidates=%d acquires=%d db_rechecks=%d", ErrOpenAISelectionProbeBudgetExhausted, candidates, acquires, rechecks)
+}
+
 func (b *openAISelectionProbeBudget) wasAttempted(accountID int64) bool {
 	if b == nil {
 		return false
@@ -490,7 +503,14 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	}
 
 	account, err := s.service.getSchedulableAccount(ctx, accountID)
-	if err != nil || account == nil {
+	if err != nil {
+		if !errors.Is(err, ErrAccountNotFound) {
+			return nil, false, fmt.Errorf("scheduler sticky account refresh failed for account %d: %w", accountID, err)
+		}
+		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
+		return nil, false, nil
+	}
+	if account == nil {
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, false, nil
 	}
@@ -506,7 +526,10 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, false, nil
 	}
-	account = s.service.recheckSelectedOpenAIAccountFromDB(stickyCtx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
+	account, err = s.service.recheckSelectedOpenAIAccountFromDBWithError(stickyCtx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
+	if err != nil {
+		return nil, false, err
+	}
 	if account == nil || !s.service.openAIAccountMatchesSchedulingGroup(account, req.GroupID) || !s.isAccountTransportCompatible(account, req.RequiredTransport) {
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, false, nil
@@ -997,6 +1020,11 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 	if plan.topK <= 0 {
 		plan.topK = 1
 	}
+	if req.Platform == PlatformGrok {
+		// A large Grok OAuth pool must keep probing when the initial Top-K
+		// candidates are temporarily busy or rate-limited.
+		plan.includeOverflowFallback = true
+	}
 
 	plan.selectionOrder = s.buildOpenAISelectionOrder(req, plan)
 	return plan
@@ -1053,6 +1081,9 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 		sort.Slice(overflow, func(i, j int) bool {
 			return isOpenAIAccountCandidateBetter(overflow[i], overflow[j])
 		})
+		if req.Platform == PlatformGrok {
+			overflow = rotateOpenAIGrokOverflow(overflow, len(primary))
+		}
 		return append(primary, overflow...)
 	}
 
@@ -1077,6 +1108,34 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 	}
 
 	return buildSelectionOrder(plan.candidates)
+}
+
+func rotateOpenAIGrokOverflow(
+	overflow []openAIAccountCandidateScore,
+	primaryCount int,
+) []openAIAccountCandidateScore {
+	if len(overflow) <= openAIAccountSelectionProbeLimit {
+		return overflow
+	}
+
+	// Concurrent Grok requests often have identical scores and therefore the same
+	// ranked overflow order. Stagger each request by one remaining probe window so
+	// they do not all contend for the same first 64 accounts while a much larger
+	// healthy pool remains untouched.
+	stride := openAIAccountSelectionProbeLimit - primaryCount
+	if stride < 1 {
+		stride = 1
+	}
+	cursor := openAIGrokOverflowRotation.Add(1) - 1
+	offset := int((cursor * uint64(stride)) % uint64(len(overflow)))
+	if offset == 0 {
+		return overflow
+	}
+
+	rotated := make([]openAIAccountCandidateScore, 0, len(overflow))
+	rotated = append(rotated, overflow[offset:]...)
+	rotated = append(rotated, overflow[:offset]...)
+	return rotated
 }
 
 func sortOpenAICompactRetryCandidates(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
@@ -1152,7 +1211,11 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			continue
 		}
 
-		fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+		fresh, resolveErr := s.service.resolveFreshSchedulableOpenAIAccountWithError(ctx, candidate.account, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+		if resolveErr != nil {
+			release(result)
+			return nil, compactBlocked, resolveErr
+		}
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 			release(result)
 			continue
@@ -1161,7 +1224,11 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			release(result)
 			break
 		}
-		fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+		fresh, acquireErr = s.service.recheckSelectedOpenAIAccountFromDBWithError(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+		if acquireErr != nil {
+			release(result)
+			return nil, compactBlocked, acquireErr
+		}
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 			release(result)
 			continue
@@ -1240,7 +1307,10 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 		if !s.isAccountRequestCompatible(ctx, account, req) || !s.isAccountTransportCompatible(account, req.RequiredTransport) {
 			continue
 		}
-		account = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
+		account, err = s.service.recheckSelectedOpenAIAccountFromDBWithError(ctx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
+		if err != nil {
+			return nil, err
+		}
 		if account == nil {
 			if accountID == req.StickyAccountID && strings.TrimSpace(req.SessionHash) != "" {
 				_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, req.SessionHash)
@@ -1625,14 +1695,20 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 					continue
 				}
 			}
-			fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+			fresh, resolveErr := s.service.resolveFreshSchedulableOpenAIAccountWithError(ctx, candidate.account, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+			if resolveErr != nil {
+				return nil, candidateCount, topK, loadSkew, resolveErr
+			}
 			if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 				continue
 			}
 			if !s.consumeOpenAISelectionDBRecheck(budget) {
-				return nil, candidateCount, topK, loadSkew, noAvailableOpenAISelectionError(req.RequestedModel, compactBlocked, filterStats.summary("selection_order_exhausted"))
+				return nil, candidateCount, topK, loadSkew, openAISelectionProbeBudgetError(budget, len(attempt.selectionOrder))
 			}
-			fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+			fresh, recheckErr := s.service.recheckSelectedOpenAIAccountFromDBWithError(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+			if recheckErr != nil {
+				return nil, candidateCount, topK, loadSkew, recheckErr
+			}
 			if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 				continue
 			}

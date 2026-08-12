@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -218,4 +219,30 @@ func (s *OpenAIGatewayService) deleteStickySessionAccountID(ctx context.Context,
 		_ = s.cache.DeleteSessionAccountID(ctx, derefGroupID(groupID), legacyKey)
 	}
 	return err
+}
+
+// ReleaseStickySessionAfterTransientForwardError lets the next request choose a
+// healthy account after a retryable post-output failure. The failed request is
+// not replayed because it may already have emitted text or invoked tools.
+func (s *OpenAIGatewayService) ReleaseStickySessionAfterTransientForwardError(
+	ctx context.Context,
+	groupID *int64,
+	sessionHash string,
+	failedAccountID int64,
+	forwardErr error,
+) bool {
+	if s == nil || s.cache == nil || strings.TrimSpace(sessionHash) == "" || failedAccountID <= 0 || forwardErr == nil {
+		return false
+	}
+	if !isOpenAITransientProcessingError(http.StatusBadRequest, forwardErr.Error(), nil) {
+		return false
+	}
+
+	stateCtx, cancel := openAIAccountStateContext(ctx)
+	defer cancel()
+	boundAccountID, err := s.getStickySessionAccountID(stateCtx, groupID, sessionHash)
+	if err != nil || boundAccountID != failedAccountID {
+		return false
+	}
+	return s.deleteStickySessionAccountID(stateCtx, groupID, sessionHash) == nil
 }

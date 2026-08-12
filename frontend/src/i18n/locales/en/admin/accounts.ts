@@ -894,6 +894,7 @@ export default {
         verifying: 'Verifying...',
         pleaseEnterSessionKey: 'Please enter at least one valid sessionKey',
         authFailed: 'Authorization failed',
+        createTimedOut: 'Authorization succeeded, but saving the account is taking longer than expected. Refresh the account list to confirm the result.',
         cookieAuthFailed: 'Cookie authorization failed',
         keyAuthFailed: 'Key {index}: {error}',
         successCreated: 'Successfully created {count} account(s)',

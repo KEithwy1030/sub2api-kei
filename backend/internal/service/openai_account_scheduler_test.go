@@ -18,20 +18,25 @@ type openAISnapshotCacheStub struct {
 	SchedulerCache
 	snapshotAccounts []*Account
 	accountsByID     map[int64]*Account
+	getAccountErr    error
 }
 
 type schedulerTestOpenAIAccountRepo struct {
 	AccountRepository
-	accounts []Account
+	accounts   []Account
+	getByIDErr error
 }
 
 func (r schedulerTestOpenAIAccountRepo) GetByID(ctx context.Context, id int64) (*Account, error) {
+	if r.getByIDErr != nil {
+		return nil, r.getByIDErr
+	}
 	for i := range r.accounts {
 		if r.accounts[i].ID == id {
 			return &r.accounts[i], nil
 		}
 	}
-	return nil, errors.New("account not found")
+	return nil, ErrAccountNotFound
 }
 
 func (r schedulerTestOpenAIAccountRepo) ListSchedulableByGroupIDAndPlatform(ctx context.Context, groupID int64, platform string) ([]Account, error) {
@@ -287,6 +292,9 @@ func (s *openAISnapshotCacheStub) GetSnapshot(ctx context.Context, bucket Schedu
 }
 
 func (s *openAISnapshotCacheStub) GetAccount(ctx context.Context, accountID int64) (*Account, error) {
+	if s.getAccountErr != nil {
+		return nil, s.getAccountErr
+	}
 	if s.accountsByID == nil {
 		return nil, nil
 	}
@@ -1946,6 +1954,74 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_DBFreshGroupRecheckRele
 	selection.ReleaseFunc()
 }
 
+func TestOpenAIAccountScheduler_DBRecheckErrorReleasesSlotAndPropagatesDependencyFailure(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(10109)
+	account := &Account{ID: 34109, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, GroupIDs: []int64{groupID}}
+	dbErr := errors.New("database recheck timeout")
+	acquiredIDs, releasedIDs := []int64{}, []int64{}
+	svc := &OpenAIGatewayService{
+		accountRepo: schedulerTestOpenAIAccountRepo{
+			accounts:   []Account{*account},
+			getByIDErr: dbErr,
+		},
+		cfg:               &config.Config{RunMode: config.RunModeStandard},
+		schedulerSnapshot: &SchedulerSnapshotService{cache: &openAISnapshotCacheStub{snapshotAccounts: []*Account{account}, accountsByID: map[int64]*Account{account.ID: account}}},
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{
+			acquiredIDs: &acquiredIDs,
+			releasedIDs: &releasedIDs,
+		}),
+	}
+	scheduler := &defaultOpenAIAccountScheduler{service: svc}
+
+	selection, _, err := scheduler.tryAcquireOpenAISelectionOrder(ctx, OpenAIAccountScheduleRequest{
+		GroupID: &groupID, Platform: PlatformGrok, RequestedModel: "grok-4.5",
+	}, []openAIAccountCandidateScore{{
+		account:  account,
+		loadInfo: &AccountLoadInfo{AccountID: account.ID},
+	}})
+
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, dbErr)
+	require.NotContains(t, err.Error(), "selection_order_exhausted")
+	require.Equal(t, []int64{account.ID}, acquiredIDs)
+	require.Equal(t, []int64{account.ID}, releasedIDs)
+}
+
+func TestOpenAIAccountScheduler_AccountRefreshErrorReleasesSlotAndPropagatesDependencyFailure(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(10110)
+	account := &Account{ID: 34110, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, GroupIDs: []int64{groupID}}
+	cacheErr := errors.New("redis account refresh timeout")
+	acquiredIDs, releasedIDs := []int64{}, []int64{}
+	svc := &OpenAIGatewayService{
+		accountRepo: schedulerTestOpenAIAccountRepo{accounts: []Account{*account}},
+		cfg:         &config.Config{RunMode: config.RunModeStandard},
+		schedulerSnapshot: &SchedulerSnapshotService{
+			cache:       &openAISnapshotCacheStub{snapshotAccounts: []*Account{account}, getAccountErr: cacheErr},
+			accountRepo: schedulerTestOpenAIAccountRepo{accounts: []Account{*account}, getByIDErr: cacheErr},
+		},
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{
+			acquiredIDs: &acquiredIDs,
+			releasedIDs: &releasedIDs,
+		}),
+	}
+	scheduler := &defaultOpenAIAccountScheduler{service: svc}
+
+	selection, _, err := scheduler.tryAcquireOpenAISelectionOrder(ctx, OpenAIAccountScheduleRequest{
+		GroupID: &groupID, Platform: PlatformGrok, RequestedModel: "grok-4.5",
+	}, []openAIAccountCandidateScore{{
+		account:  account,
+		loadInfo: &AccountLoadInfo{AccountID: account.ID},
+	}})
+
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, cacheErr)
+	require.NotContains(t, err.Error(), "selection_order_exhausted")
+	require.Equal(t, []int64{account.ID}, acquiredIDs)
+	require.Equal(t, []int64{account.ID}, releasedIDs)
+}
+
 func TestOpenAIGatewayService_SelectAccountWithLoadAwareness_DBFreshGroupRecheckWaitsOnValidAccount(t *testing.T) {
 	ctx := context.Background()
 	groupID, otherGroupID := int64(10107), int64(10108)
@@ -3088,6 +3164,269 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_LoadBalanceTopKFallback
 	if selection.ReleaseFunc != nil {
 		selection.ReleaseFunc()
 	}
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_GrokFallsBackBeyondTopK(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(112)
+	accounts := []Account{
+		{ID: 37201, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1},
+		{ID: 37202, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1},
+		{ID: 37203, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1},
+	}
+
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.LBTopK = 2
+	cfg.Gateway.OpenAIWS.SchedulerScoreWeights.Load = 1.0
+	cfg.Gateway.OpenAIWS.SchedulerScoreWeights.Queue = 1.0
+
+	acquiredIDs := make([]int64, 0, 3)
+	concurrencyCache := schedulerTestConcurrencyCache{
+		loadMap: map[int64]*AccountLoadInfo{
+			37201: {AccountID: 37201, LoadRate: 0},
+			37202: {AccountID: 37202, LoadRate: 10},
+			37203: {AccountID: 37203, LoadRate: 90},
+		},
+		acquireResults: map[int64]bool{
+			37201: false,
+			37202: false,
+			37203: true,
+		},
+		acquiredIDs: &acquiredIDs,
+	}
+
+	svc := &OpenAIGatewayService{
+		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: accounts},
+		cache:              &schedulerTestGatewayCache{},
+		cfg:                cfg,
+		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("true"),
+		concurrencyService: NewConcurrencyService(concurrencyCache),
+	}
+
+	selection, decision, err := svc.SelectAccountWithSchedulerForCapability(
+		ctx, &groupID, "", "", "grok-4.5", nil,
+		OpenAIUpstreamTransportAny, "", false, false, false, PlatformGrok,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(37203), selection.Account.ID)
+	require.Equal(t, 3, decision.CandidateCount)
+	require.Equal(t, 2, decision.TopK)
+	require.Contains(t, acquiredIDs, int64(37203))
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
+func TestOpenAIAccountScheduler_GrokStaggersLargeOverflowWindows(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.LBTopK = 2
+
+	accounts := make([]*Account, 0, 132)
+	loadMap := make(map[int64]*AccountLoadInfo, 132)
+	for id := int64(1); id <= 132; id++ {
+		accounts = append(accounts, &Account{
+			ID:          id,
+			Platform:    PlatformGrok,
+			Type:        AccountTypeOAuth,
+			Status:      StatusActive,
+			Schedulable: true,
+			Concurrency: 1,
+		})
+		loadMap[id] = &AccountLoadInfo{AccountID: id}
+	}
+
+	scheduler := newDefaultOpenAIAccountScheduler(&OpenAIGatewayService{cfg: cfg}, nil).(*defaultOpenAIAccountScheduler)
+	req := OpenAIAccountScheduleRequest{
+		Platform:       PlatformGrok,
+		RequestedModel: "grok-4.5",
+		SessionHash:    "same-session",
+	}
+
+	first := scheduler.buildOpenAIAccountLoadPlan(context.Background(), req, accounts, loadMap).selectionOrder
+	second := scheduler.buildOpenAIAccountLoadPlan(context.Background(), req, accounts, loadMap).selectionOrder
+	require.Len(t, first, len(accounts))
+	require.Len(t, second, len(accounts))
+
+	firstPrimary := []int64{first[0].account.ID, first[1].account.ID}
+	secondPrimary := []int64{second[0].account.ID, second[1].account.ID}
+	require.Equal(t, firstPrimary, secondPrimary, "Top-K ordering must remain stable")
+	require.NotEqual(t, first[2].account.ID, second[2].account.ID, "overflow windows must not share a fixed starting account")
+
+	firstIDs := make([]int64, 0, len(first))
+	secondIDs := make([]int64, 0, len(second))
+	for _, candidate := range first {
+		firstIDs = append(firstIDs, candidate.account.ID)
+	}
+	for _, candidate := range second {
+		secondIDs = append(secondIDs, candidate.account.ID)
+	}
+	require.ElementsMatch(t, firstIDs, secondIDs, "rotation must preserve the full candidate set")
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_GrokNextRequestEscapesExhaustedProbeWindow(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(114)
+	accounts := make([]Account, 0, 132)
+	loadMap := make(map[int64]*AccountLoadInfo, 132)
+	acquireResults := make(map[int64]bool, 132)
+	for id := int64(1); id <= 132; id++ {
+		accounts = append(accounts, Account{
+			ID:          id,
+			Platform:    PlatformGrok,
+			Type:        AccountTypeOAuth,
+			Status:      StatusActive,
+			Schedulable: true,
+			Concurrency: 1,
+		})
+		loadMap[id] = &AccountLoadInfo{AccountID: id}
+		acquireResults[id] = false
+	}
+	acquireResults[67] = true
+
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.LBTopK = 2
+	cfg.Gateway.OpenAIWS.SchedulerScoreWeights.Load = 1.0
+	cfg.Gateway.OpenAIWS.SchedulerScoreWeights.Queue = 1.0
+
+	acquiredIDs := make([]int64, 0, openAIAccountSelectionProbeLimit)
+	concurrencyCache := schedulerTestConcurrencyCache{
+		loadMap:        loadMap,
+		acquireResults: acquireResults,
+		acquiredIDs:    &acquiredIDs,
+	}
+	svc := &OpenAIGatewayService{
+		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: accounts},
+		cache:              &schedulerTestGatewayCache{},
+		cfg:                cfg,
+		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("true"),
+		concurrencyService: NewConcurrencyService(concurrencyCache),
+	}
+
+	openAIGrokOverflowRotation.Store(0)
+	defer openAIGrokOverflowRotation.Store(0)
+	first, _, firstErr := svc.SelectAccountWithSchedulerForCapability(
+		ctx, &groupID, "", "same-session", "grok-4.5", nil,
+		OpenAIUpstreamTransportAny, "", false, false, false, PlatformGrok,
+	)
+	require.NoError(t, firstErr)
+	require.NotNil(t, first)
+	require.False(t, first.Acquired)
+	require.NotNil(t, first.WaitPlan)
+	require.Len(t, acquiredIDs, openAIAccountSelectionProbeLimit)
+	require.NotContains(t, acquiredIDs, int64(67))
+
+	acquiredIDs = acquiredIDs[:0]
+	second, _, secondErr := svc.SelectAccountWithSchedulerForCapability(
+		ctx, &groupID, "", "same-session", "grok-4.5", nil,
+		OpenAIUpstreamTransportAny, "", false, false, false, PlatformGrok,
+	)
+	require.NoError(t, secondErr)
+	require.NotNil(t, second)
+	require.NotNil(t, second.Account)
+	require.Equal(t, int64(67), second.Account.ID)
+	require.Contains(t, acquiredIDs, int64(67))
+	if second.ReleaseFunc != nil {
+		second.ReleaseFunc()
+	}
+}
+
+func TestOpenAIAccountScheduler_StaleCandidatesExhaustProbeBudgetWithoutClaimingPoolEmpty(t *testing.T) {
+	ctx := context.Background()
+	groupID, otherGroupID := int64(115), int64(116)
+	accounts := make([]Account, 0, openAIAccountSelectionProbeLimit+1)
+	snapshotAccounts := make([]*Account, 0, openAIAccountSelectionProbeLimit+1)
+	accountsByID := make(map[int64]*Account, openAIAccountSelectionProbeLimit+1)
+	selectionOrder := make([]openAIAccountCandidateScore, 0, openAIAccountSelectionProbeLimit+1)
+	for id := int64(1); id <= openAIAccountSelectionProbeLimit+1; id++ {
+		cached := &Account{ID: id, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, GroupIDs: []int64{groupID}}
+		latest := *cached
+		latest.GroupIDs = []int64{otherGroupID}
+		accounts = append(accounts, latest)
+		snapshotAccounts = append(snapshotAccounts, cached)
+		accountsByID[id] = cached
+		selectionOrder = append(selectionOrder, openAIAccountCandidateScore{
+			account:  cached,
+			loadInfo: &AccountLoadInfo{AccountID: id},
+		})
+	}
+	svc := &OpenAIGatewayService{
+		accountRepo: schedulerTestOpenAIAccountRepo{accounts: accounts},
+		cfg:         &config.Config{RunMode: config.RunModeStandard},
+		schedulerSnapshot: &SchedulerSnapshotService{
+			cache:       &openAISnapshotCacheStub{snapshotAccounts: snapshotAccounts, accountsByID: accountsByID},
+			accountRepo: schedulerTestOpenAIAccountRepo{accounts: accounts},
+		},
+	}
+	scheduler := &defaultOpenAIAccountScheduler{service: svc}
+	budget := newOpenAISelectionProbeBudget()
+	budget.enableLimit()
+
+	selection, _, _, _, err := scheduler.finishLoadBalanceSelectionFallback(
+		ctx,
+		OpenAIAccountScheduleRequest{GroupID: &groupID, Platform: PlatformGrok, RequestedModel: "grok-4.5"},
+		openAIAccountLoadSelectionAttempt{
+			selectionOrder: selectionOrder,
+			candidateCount: len(selectionOrder),
+			topK:           2,
+		},
+		budget,
+		openAISelectionFilterStats{pool: len(selectionOrder)},
+	)
+
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, ErrOpenAISelectionProbeBudgetExhausted)
+	require.NotErrorIs(t, err, ErrNoAvailableAccounts)
+	require.NotContains(t, err.Error(), "selection_order_exhausted")
+	require.Equal(t, openAIAccountSelectionProbeLimit, budget.rechecks)
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_OpenAIDoesNotFallBackBeyondTopK(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(113)
+	accounts := []Account{
+		{ID: 37301, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 1},
+		{ID: 37302, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 1},
+		{ID: 37303, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 1},
+	}
+
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.LBTopK = 2
+	cfg.Gateway.OpenAIWS.SchedulerScoreWeights.Load = 1.0
+	cfg.Gateway.OpenAIWS.SchedulerScoreWeights.Queue = 1.0
+
+	acquiredIDs := make([]int64, 0, 4)
+	concurrencyCache := schedulerTestConcurrencyCache{
+		loadMap: map[int64]*AccountLoadInfo{
+			37301: {AccountID: 37301, LoadRate: 0},
+			37302: {AccountID: 37302, LoadRate: 10},
+			37303: {AccountID: 37303, LoadRate: 90},
+		},
+		acquireResults: map[int64]bool{
+			37301: false,
+			37302: false,
+			37303: true,
+		},
+		acquiredIDs: &acquiredIDs,
+	}
+
+	svc := &OpenAIGatewayService{
+		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: accounts},
+		cache:              &schedulerTestGatewayCache{},
+		cfg:                cfg,
+		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("true"),
+		concurrencyService: NewConcurrencyService(concurrencyCache),
+	}
+
+	selection, _, err := svc.SelectAccountWithSchedulerForCapability(
+		ctx, &groupID, "", "", "gpt-5.1", nil,
+		OpenAIUpstreamTransportAny, "", false, false, false, PlatformOpenAI,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.NotContains(t, acquiredIDs, int64(37303))
 }
 
 // Regression: TopK initial filter must drop quota-auto-paused accounts. Otherwise

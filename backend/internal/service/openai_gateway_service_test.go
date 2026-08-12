@@ -522,6 +522,60 @@ func (c *stubGatewayCache) DeleteSessionAccountID(ctx context.Context, groupID i
 	return nil
 }
 
+func TestReleaseStickySessionAfterTransientForwardError(t *testing.T) {
+	const sessionHash = "post-output-overload"
+	primaryKey := "openai:" + sessionHash
+
+	tests := []struct {
+		name             string
+		boundAccountID   int64
+		failedAccountID  int64
+		forwardErr       error
+		wantReleased     bool
+		wantBindingAfter bool
+	}{
+		{
+			name:             "matching overload releases binding",
+			boundAccountID:   2606,
+			failedAccountID:  2606,
+			forwardErr:       errors.New("upstream response failed: Our servers are currently overloaded. Please try again later."),
+			wantReleased:     true,
+			wantBindingAfter: false,
+		},
+		{
+			name:             "newer healthy binding is preserved",
+			boundAccountID:   2600,
+			failedAccountID:  2606,
+			forwardErr:       errors.New("upstream response failed: Our servers are currently overloaded. Please try again later."),
+			wantReleased:     false,
+			wantBindingAfter: true,
+		},
+		{
+			name:             "non transient failure preserves binding",
+			boundAccountID:   2606,
+			failedAccountID:  2606,
+			forwardErr:       errors.New("upstream response failed: request blocked by content policy"),
+			wantReleased:     false,
+			wantBindingAfter: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cache := &stubGatewayCache{sessionBindings: map[string]int64{primaryKey: tt.boundAccountID}}
+			svc := &OpenAIGatewayService{cache: cache}
+
+			released := svc.ReleaseStickySessionAfterTransientForwardError(
+				context.Background(), nil, sessionHash, tt.failedAccountID, tt.forwardErr,
+			)
+
+			require.Equal(t, tt.wantReleased, released)
+			_, bindingExists := cache.sessionBindings[primaryKey]
+			require.Equal(t, tt.wantBindingAfter, bindingExists)
+		})
+	}
+}
+
 func TestOpenAISelectAccountWithLoadAwareness_FiltersUnschedulable(t *testing.T) {
 	now := time.Now()
 	resetAt := now.Add(10 * time.Minute)
@@ -1516,6 +1570,47 @@ func TestOpenAIStreamingResponseFailedBeforeOutputCapacityErrorReturnsFailover(t
 	require.ErrorAs(t, err, &failoverErr)
 	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
 	require.Contains(t, string(failoverErr.ResponseBody), "Selected model is at capacity")
+	require.False(t, c.Writer.Written())
+	require.Empty(t, rec.Body.String())
+}
+
+func TestOpenAIStreamingResponseFailedBeforeOutputOverloadedMessageReturnsFailover(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			StreamDataIntervalTimeout: 0,
+			StreamKeepaliveInterval:   0,
+			MaxLineSize:               defaultMaxLineSize,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+			"event: response.created",
+			`data: {"type":"response.created","response":{"id":"resp_1"}}`,
+			"",
+			"event: response.in_progress",
+			`data: {"type":"response.in_progress","response":{"id":"resp_1"}}`,
+			"",
+			"event: response.failed",
+			`data: {"type":"response.failed","response":{"id":"resp_1","error":{"message":"Our servers are currently overloaded. Please try again later.","type":"invalid_request_error"}}}`,
+			"",
+		}, "\n"))),
+		Header: http.Header{"X-Request-Id": []string{"rid-overloaded-message"}},
+	}
+
+	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI, Name: "acc"}, time.Now(), "model", "model")
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
+	require.Contains(t, string(failoverErr.ResponseBody), "Our servers are currently overloaded")
 	require.False(t, c.Writer.Written())
 	require.Empty(t, rec.Body.String())
 }

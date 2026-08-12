@@ -945,6 +945,7 @@ export default {
         verifying: '验证中...',
         pleaseEnterSessionKey: '请输入至少一个有效的 sessionKey',
         authFailed: '授权失败',
+        createTimedOut: '授权已完成，但账号保存时间过长，请刷新账号列表确认结果',
         cookieAuthFailed: 'Cookie 授权失败',
         keyAuthFailed: '密钥 {index}: {error}',
         successCreated: '成功创建 {count} 个账号',

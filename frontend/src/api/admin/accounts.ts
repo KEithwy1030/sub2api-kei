@@ -138,7 +138,9 @@ export async function getById(id: number): Promise<Account> {
  * @returns Created account
  */
 export async function create(accountData: CreateAccountRequest): Promise<Account> {
-  const { data } = await apiClient.post<Account>('/admin/accounts', accountData)
+  const { data } = await apiClient.post<Account>('/admin/accounts', accountData, {
+    timeout: 60000
+  })
   return data
 }
 

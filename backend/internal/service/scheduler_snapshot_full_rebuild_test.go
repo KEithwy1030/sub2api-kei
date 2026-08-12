@@ -21,6 +21,32 @@ type schedulerFullRebuildTestCache struct {
 	lockCalls int
 }
 
+type schedulerSnapshotFreshnessTestCache struct {
+	SchedulerCache
+	cached []*Account
+}
+
+func (c *schedulerSnapshotFreshnessTestCache) GetSnapshot(context.Context, SchedulerBucket) ([]*Account, bool, error) {
+	return c.cached, true, nil
+}
+
+func (c *schedulerSnapshotFreshnessTestCache) CaptureBucketWriteToken(_ context.Context, bucket SchedulerBucket) (SchedulerBucketWriteToken, error) {
+	return SchedulerBucketWriteToken{Bucket: bucket, Epoch: 1}, nil
+}
+
+func (c *schedulerSnapshotFreshnessTestCache) SetSnapshot(context.Context, SchedulerBucket, SchedulerBucketWriteToken, []Account) error {
+	return nil
+}
+
+type schedulerSnapshotFreshnessAccountRepo struct {
+	AccountRepository
+	accounts []Account
+}
+
+func (r schedulerSnapshotFreshnessAccountRepo) ListSchedulableByGroupIDAndPlatform(context.Context, int64, string) ([]Account, error) {
+	return append([]Account(nil), r.accounts...), nil
+}
+
 func (c *schedulerFullRebuildTestCache) ListBuckets(context.Context) ([]SchedulerBucket, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -153,6 +179,26 @@ func TestSchedulerSnapshotServiceInitialFullRebuildFailsClosedWhenListBucketsFai
 	svc.fullRebuildStateMu.Lock()
 	require.ErrorIs(t, svc.fullRebuildLastErr, cache.listErr)
 	svc.fullRebuildStateMu.Unlock()
+}
+
+func TestSchedulerSnapshotServiceUntrustedSyncBypassesCachedSnapshot(t *testing.T) {
+	groupID := int64(8)
+	stale := &Account{ID: 1, Platform: PlatformGrok, Status: StatusActive, Schedulable: true}
+	fresh := Account{ID: 2, Platform: PlatformGrok, Status: StatusActive, Schedulable: true}
+	svc := NewSchedulerSnapshotService(
+		&schedulerSnapshotFreshnessTestCache{cached: []*Account{stale}},
+		nil,
+		schedulerSnapshotFreshnessAccountRepo{accounts: []Account{fresh}},
+		nil,
+		nil,
+	)
+	svc.snapshotSyncUntrusted.Store(true)
+
+	accounts, _, err := svc.ListSchedulableAccounts(context.Background(), &groupID, PlatformGrok, false)
+
+	require.NoError(t, err)
+	require.Len(t, accounts, 1)
+	require.Equal(t, fresh.ID, accounts[0].ID)
 }
 
 func schedulerFullRebuildState(svc *SchedulerSnapshotService) (requested uint64, completed uint64) {

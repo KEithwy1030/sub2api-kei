@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -137,6 +138,7 @@ type SchedulerSnapshotService struct {
 	outboxRebuildRetryReason     string
 	outboxLagWarningActive       bool
 	outboxMaxIDErrorLastLoggedAt time.Time
+	snapshotSyncUntrusted        atomic.Bool
 
 	fullRebuildRunMu     sync.Mutex
 	fullRebuildStateMu   sync.Mutex
@@ -171,6 +173,9 @@ func (s *SchedulerSnapshotService) Start() {
 	if s == nil || s.cache == nil {
 		return
 	}
+	// Existing Redis snapshots have no freshness proof until this process has
+	// completed an outbox poll or a rebuild.
+	s.snapshotSyncUntrusted.Store(true)
 
 	s.wg.Add(1)
 	go func() {
@@ -218,7 +223,7 @@ func (s *SchedulerSnapshotService) ListSchedulableAccounts(ctx context.Context, 
 		cached, hit, err := s.cache.GetSnapshot(ctx, bucket)
 		if err != nil {
 			logger.LegacyPrintf("service.scheduler_snapshot", "[Scheduler] cache read failed: bucket=%s err=%v", bucket.String(), err)
-		} else if hit {
+		} else if hit && !s.snapshotSyncUntrusted.Load() {
 			return derefAccounts(cached), useMixed, nil
 		}
 		token, err := s.cache.CaptureBucketWriteToken(ctx, bucket)
@@ -304,6 +309,7 @@ func (s *SchedulerSnapshotService) runInitialRebuild() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		if err := s.rebuildFullSnapshot(ctx, "startup"); err != nil {
+			s.snapshotSyncUntrusted.Store(true)
 			logger.LegacyPrintf("service.scheduler_snapshot", "[Scheduler] rebuild startup failed: %v", err)
 			return err
 		}
@@ -334,6 +340,7 @@ func (s *SchedulerSnapshotService) runFullRebuildWorker(interval time.Duration) 
 		select {
 		case <-ticker.C:
 			if err := s.triggerFullRebuild("interval"); err != nil {
+				s.snapshotSyncUntrusted.Store(true)
 				logger.LegacyPrintf("service.scheduler_snapshot", "[Scheduler] full rebuild failed: %v", err)
 			}
 		case <-s.stopCh:
@@ -351,12 +358,14 @@ func (s *SchedulerSnapshotService) pollOutbox() {
 
 	watermark, err := s.cache.GetOutboxWatermark(ctx)
 	if err != nil {
+		s.snapshotSyncUntrusted.Store(true)
 		logger.LegacyPrintf("service.scheduler_snapshot", "[Scheduler] outbox watermark read failed: %v", err)
 		return
 	}
 
 	events, err := s.outboxRepo.ListAfterAndReleaseDedup(ctx, watermark, 200)
 	if err != nil {
+		s.snapshotSyncUntrusted.Store(true)
 		logger.LegacyPrintf("service.scheduler_snapshot", "[Scheduler] outbox poll failed: %v", err)
 		return
 	}
@@ -365,6 +374,7 @@ func (s *SchedulerSnapshotService) pollOutbox() {
 		// Clear degraded/retry state without adding two more repository queries to
 		// the healthy one-second poll path.
 		s.clearOutboxDegradedEpisode()
+		s.snapshotSyncUntrusted.Store(false)
 		return
 	}
 
@@ -374,6 +384,7 @@ func (s *SchedulerSnapshotService) pollOutbox() {
 		err := s.handleOutboxEvent(eventCtx, event, seen)
 		cancel()
 		if err != nil {
+			s.snapshotSyncUntrusted.Store(true)
 			logger.LegacyPrintf("service.scheduler_snapshot", "[Scheduler] outbox handle failed: id=%d type=%s err=%v", event.ID, event.EventType, err)
 			return
 		}
@@ -393,6 +404,7 @@ func (s *SchedulerSnapshotService) pollOutbox() {
 		}
 	}
 	if wmErr != nil {
+		s.snapshotSyncUntrusted.Store(true)
 		logger.LegacyPrintf("service.scheduler_snapshot", "[Scheduler] outbox watermark write failed: %v", wmErr)
 		return
 	}
@@ -1248,6 +1260,7 @@ func (s *SchedulerSnapshotService) checkOutboxLag(ctx context.Context, watermark
 	now := time.Now()
 	oldestCreatedAt, ok, err := s.outboxRepo.FirstCreatedAtAfter(ctx, watermark)
 	if err != nil {
+		s.snapshotSyncUntrusted.Store(true)
 		logger.LegacyPrintf("service.scheduler_snapshot", "[Scheduler] outbox pending event read failed: %v", err)
 		return
 	}
@@ -1271,6 +1284,7 @@ func (s *SchedulerSnapshotService) checkOutboxLag(ctx context.Context, watermark
 		maxID, maxErr := s.outboxRepo.MaxID(ctx)
 		if maxErr != nil {
 			backlogKnown = false
+			s.snapshotSyncUntrusted.Store(true)
 			if s.shouldLogOutboxMaxIDError(now) {
 				logger.LegacyPrintf("service.scheduler_snapshot", "[Scheduler] outbox max id read failed: %v", maxErr)
 			}
@@ -1287,11 +1301,15 @@ func (s *SchedulerSnapshotService) checkOutboxLag(ctx context.Context, watermark
 	s.lagMu.Lock()
 	fullyRecovered := !lagDegraded && backlogKnown && !backlogDegraded
 	if fullyRecovered {
+		s.snapshotSyncUntrusted.Store(false)
 		s.lagFailures = 0
 		s.outboxRebuildLatched = false
 		s.outboxRebuildFailures = 0
 		s.outboxRebuildRetryAt = time.Time{}
 		s.outboxRebuildRetryReason = ""
+	}
+	if lagWarning || lagDegraded || backlogDegraded {
+		s.snapshotSyncUntrusted.Store(true)
 	}
 
 	if s.outboxRebuildRetryReason != "" {

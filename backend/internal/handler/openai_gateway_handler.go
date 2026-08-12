@@ -592,6 +592,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				}
 				h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, account.GetMappedModel(reqModel), false, nil)
 				upstreamErrorAlreadyCommunicated := openAIForwardErrorAlreadyCommunicated(c, writerSizeBeforeForward, err)
+				stickyReleased := false
+				if upstreamErrorAlreadyCommunicated {
+					stickyReleased = h.gatewayService.ReleaseStickySessionAfterTransientForwardError(
+						c.Request.Context(), apiKey.GroupID, sessionHash, account.ID, err,
+					)
+				}
 				wroteFallback := false
 				if !upstreamErrorAlreadyCommunicated {
 					wroteFallback = h.ensureForwardErrorResponse(c, streamStarted)
@@ -600,6 +606,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					zap.Int64("account_id", account.ID),
 					zap.Bool("fallback_error_response_written", wroteFallback),
 					zap.Bool("upstream_error_response_already_written", upstreamErrorAlreadyCommunicated),
+					zap.Bool("sticky_session_released", stickyReleased),
 					zap.Error(err),
 				}
 				if shouldLogOpenAIForwardFailureAsWarn(c, wroteFallback) {
