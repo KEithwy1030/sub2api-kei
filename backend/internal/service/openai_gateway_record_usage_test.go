@@ -12,6 +12,96 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestBillableOpenAIOutputTokens_Grok46IncludesReasoning(t *testing.T) {
+	t.Parallel()
+
+	chatUsage := OpenAIUsage{OutputTokens: 6, ReasoningTokens: 474, ReasoningTokensSeparate: true}
+	require.Equal(t, 480, billableOpenAIOutputTokens(chatUsage, "grok-4.6"))
+	require.Equal(t, 480, billableOpenAIOutputTokens(chatUsage, "xai/grok-4.6"))
+	require.Equal(t, 6, billableOpenAIOutputTokens(chatUsage, "grok-4.5"))
+	require.Equal(t, 6, billableOpenAIOutputTokens(chatUsage, ""))
+
+	responsesUsage := OpenAIUsage{OutputTokens: 480, ReasoningTokens: 474}
+	require.Equal(t, 480, billableOpenAIOutputTokens(responsesUsage, "grok-4.6"))
+}
+
+func TestOpenAIGatewayServiceRecordUsage_Grok46ReasoningBillingByProtocol(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "chat completion excludes reasoning from completion tokens",
+			body: `{"usage":{"prompt_tokens":18254,"completion_tokens":6,"prompt_tokens_details":{"cached_tokens":192},"completion_tokens_details":{"reasoning_tokens":474}}}`,
+		},
+		{
+			name: "responses output already includes reasoning",
+			body: `{"usage":{"input_tokens":18254,"output_tokens":480,"input_tokens_details":{"cached_tokens":192},"output_tokens_details":{"reasoning_tokens":474}}}`,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			parsedUsage, ok := extractOpenAIUsageFromJSONBytes([]byte(tt.body))
+			require.True(t, ok)
+
+			usageRepo := &openAIRecordUsageLogRepoStub{inserted: true}
+			userRepo := &openAIRecordUsageUserRepoStub{}
+			subRepo := &openAIRecordUsageSubRepoStub{}
+			svc := newOpenAIRecordUsageServiceForTest(usageRepo, userRepo, subRepo, nil)
+
+			err := svc.RecordUsage(context.Background(), &OpenAIRecordUsageInput{
+				Result: &OpenAIForwardResult{
+					RequestID: "grok46_reasoning_usage",
+					Usage:     parsedUsage,
+					Model:     "grok-4.6",
+					Duration:  time.Second,
+				},
+				APIKey:  &APIKey{ID: 1046},
+				User:    &User{ID: 2046},
+				Account: &Account{ID: 3046, Platform: PlatformGrok},
+			})
+
+			require.NoError(t, err)
+			require.NotNil(t, usageRepo.lastLog)
+			require.Equal(t, 18062, usageRepo.lastLog.InputTokens)
+			require.Equal(t, 480, usageRepo.lastLog.OutputTokens)
+			require.Equal(t, 192, usageRepo.lastLog.CacheReadTokens)
+			require.InDelta(t, 18062*2e-6, usageRepo.lastLog.InputCost, 1e-12)
+			require.InDelta(t, 480*6e-6, usageRepo.lastLog.OutputCost, 1e-12)
+			require.InDelta(t, 192*0.5e-6, usageRepo.lastLog.CacheReadCost, 1e-12)
+			require.InDelta(t, 0.0391, usageRepo.lastLog.TotalCost, 1e-12)
+			require.InDelta(t, 0.04301, usageRepo.lastLog.ActualCost, 1e-12)
+			require.Equal(t, 1, userRepo.deductCalls)
+			require.InDelta(t, 0.04301, userRepo.lastAmount, 1e-12)
+		})
+	}
+}
+
+func TestOpenAIGatewayServiceRecordUsage_Grok46ReasoningUsesSelectedBillingModel(t *testing.T) {
+	parsedUsage, ok := extractOpenAIUsageFromJSONBytes([]byte(`{"usage":{"prompt_tokens":100,"completion_tokens":6,"completion_tokens_details":{"reasoning_tokens":474}}}`))
+	require.True(t, ok)
+
+	usageRepo := &openAIRecordUsageLogRepoStub{inserted: true}
+	svc := newOpenAIRecordUsageServiceForTest(usageRepo, &openAIRecordUsageUserRepoStub{}, &openAIRecordUsageSubRepoStub{}, nil)
+	err := svc.RecordUsage(context.Background(), &OpenAIRecordUsageInput{
+		Result: &OpenAIForwardResult{
+			RequestID:    "grok46_mapped_usage",
+			Usage:        parsedUsage,
+			Model:        "grok-4.6",
+			BillingModel: "grok-4.3",
+			Duration:     time.Second,
+		},
+		APIKey:  &APIKey{ID: 1047},
+		User:    &User{ID: 2047},
+		Account: &Account{ID: 3047, Platform: PlatformGrok},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, usageRepo.lastLog)
+	require.Equal(t, 6, usageRepo.lastLog.OutputTokens)
+}
+
 type openAIRecordUsageLogRepoStub struct {
 	UsageLogRepository
 

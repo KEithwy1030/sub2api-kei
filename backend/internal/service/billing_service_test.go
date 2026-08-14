@@ -810,8 +810,8 @@ func TestComputeTokenBreakdown_GptImage2ImageEditIssue4386(t *testing.T) {
 
 	cost := svc.computeTokenBreakdown(pricing, tokens, 1.0, "", false)
 
-	wantTextInput := float64(19) * 5e-6    // 0.000095
-	wantImageInput := float64(352) * 8e-6  // 0.002816
+	wantTextInput := float64(19) * 5e-6     // 0.000095
+	wantImageInput := float64(352) * 8e-6   // 0.002816
 	wantImageOutput := float64(439) * 30e-6 // 0.013170
 	require.InDelta(t, wantTextInput, cost.InputCost, 1e-15, "InputCost 仅含文本输入")
 	require.InDelta(t, wantImageInput, cost.ImageInputCost, 1e-15, "图片输入按 $8/1M 独立计费")
@@ -1138,10 +1138,12 @@ func TestCalculateCost_Grok46AppliesOfficialLongContextThreshold(t *testing.T) {
 	require.InDelta(t, 12e-6, long.OutputCost, 1e-12)
 }
 
-func TestBillingModelsContainGrok46(t *testing.T) {
-	require.True(t, billingModelsContainGrok46([]string{"grok", "grok-4.6"}))
-	require.True(t, billingModelsContainGrok46([]string{" GROK-4.6 "}))
-	require.False(t, billingModelsContainGrok46([]string{"grok-4.5"}))
+func TestIsGrok46BillingModel(t *testing.T) {
+	require.True(t, isGrok46BillingModel("grok-4.6"))
+	require.True(t, isGrok46BillingModel(" GROK-4.6 "))
+	require.True(t, isGrok46BillingModel("xai/grok-4.6"))
+	require.False(t, isGrok46BillingModel("grok-4.5"))
+	require.False(t, isGrok46BillingModel("grok-4.6-preview"))
 }
 
 func TestGetModelPricing_GrokCatalogFallbacks(t *testing.T) {
