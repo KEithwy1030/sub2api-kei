@@ -209,7 +209,9 @@ func newSchedulerTestSubscriptionPriorityConfig() *config.Config {
 }
 
 type openAIAdvancedSchedulerSettingRepoStub struct {
-	values map[string]string
+	values         map[string]string
+	getValueErr    error
+	getMultipleErr error
 }
 
 func (s *openAIAdvancedSchedulerSettingRepoStub) Get(ctx context.Context, key string) (*Setting, error) {
@@ -221,6 +223,9 @@ func (s *openAIAdvancedSchedulerSettingRepoStub) Get(ctx context.Context, key st
 }
 
 func (s *openAIAdvancedSchedulerSettingRepoStub) GetValue(_ context.Context, key string) (string, error) {
+	if s != nil && s.getValueErr != nil {
+		return "", s.getValueErr
+	}
 	if s == nil || s.values == nil {
 		return "", ErrSettingNotFound
 	}
@@ -236,6 +241,9 @@ func (s *openAIAdvancedSchedulerSettingRepoStub) Set(context.Context, string, st
 }
 
 func (s *openAIAdvancedSchedulerSettingRepoStub) GetMultiple(_ context.Context, keys []string) (map[string]string, error) {
+	if s != nil && s.getMultipleErr != nil {
+		return nil, s.getMultipleErr
+	}
 	result := make(map[string]string, len(keys))
 	for _, key := range keys {
 		if value, err := s.GetValue(context.Background(), key); err == nil {
@@ -347,6 +355,56 @@ func TestOpenAIGatewayService_OpenAIAdvancedSchedulerRuntimeSettings_DBOverrides
 	require.Equal(t, 0.25, weights.Reset)
 	require.Equal(t, 12.0, weights.Previous)
 	require.Equal(t, 10.0, weights.SessionSticky)
+}
+
+func TestOpenAIGatewayService_GrokAdvancedSchedulerSettingFailureUsesLastGoodValue(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+	defer resetOpenAIAdvancedSchedulerSettingCacheForTest()
+
+	dependencyErr := errors.New("settings database unavailable")
+	repo := &openAIAdvancedSchedulerSettingRepoStub{values: map[string]string{
+		openAIAdvancedSchedulerSettingKey: "true",
+	}}
+	svc := &OpenAIGatewayService{
+		rateLimitService: &RateLimitService{settingService: NewSettingService(repo, &config.Config{})},
+	}
+
+	initial := svc.openAIAdvancedSchedulerRuntimeSettings(context.Background())
+	require.True(t, initial.enabled)
+	require.NoError(t, initial.loadErr)
+
+	cached := openAIAdvancedSchedulerSettingCache.Load().(*cachedOpenAIAdvancedSchedulerSetting)
+	cached.expiresAt = time.Now().Add(-time.Second).UnixNano()
+	repo.getMultipleErr = dependencyErr
+	repo.getValueErr = dependencyErr
+
+	stale := svc.openAIAdvancedSchedulerRuntimeSettings(context.Background())
+	require.True(t, stale.enabled)
+	require.NoError(t, stale.loadErr)
+	require.NotNil(t, svc.getOpenAIAccountSchedulerWithSettings(stale))
+}
+
+func TestOpenAIGatewayService_GrokAdvancedSchedulerSettingFailureDoesNotUseLegacy(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+	defer resetOpenAIAdvancedSchedulerSettingCacheForTest()
+
+	dependencyErr := errors.New("settings database unavailable")
+	repo := &openAIAdvancedSchedulerSettingRepoStub{
+		getMultipleErr: dependencyErr,
+		getValueErr:    dependencyErr,
+	}
+	svc := &OpenAIGatewayService{
+		rateLimitService: &RateLimitService{settingService: NewSettingService(repo, &config.Config{})},
+	}
+
+	selection, _, err := svc.SelectAccountWithSchedulerForCapability(
+		context.Background(), nil, "", "", "grok-4.5", nil,
+		OpenAIUpstreamTransportAny, "", false, false, false, PlatformGrok,
+	)
+
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, ErrOpenAIAdvancedSchedulerSettingsUnavailable)
+	require.NotErrorIs(t, err, ErrNoAvailableAccounts)
 }
 
 func TestOpenAIGatewayService_OpenAIAdvancedSchedulerRuntimeSettings_InvalidWeightSumsFallBackToConfig(t *testing.T) {
@@ -4034,6 +4092,30 @@ func TestDefaultOpenAIAccountScheduler_IsAccountTransportCompatible_Branches(t *
 
 func int64PtrForTest(v int64) *int64 {
 	return &v
+}
+
+func TestOpenAIAccountScheduler_GrokWeightedStickyRefreshErrorPropagates(t *testing.T) {
+	dependencyErr := errors.New("sticky account database unavailable")
+	groupID := int64(101080)
+	snapshot := &SchedulerSnapshotService{
+		cache:       &openAISnapshotCacheStub{getAccountErr: dependencyErr},
+		accountRepo: schedulerTestOpenAIAccountRepo{getByIDErr: dependencyErr},
+	}
+	scheduler := &defaultOpenAIAccountScheduler{service: &OpenAIGatewayService{
+		schedulerSnapshot: snapshot,
+	}}
+
+	selection, err := scheduler.tryFallbackToWeightedSticky(context.Background(), OpenAIAccountScheduleRequest{
+		GroupID:                 &groupID,
+		Platform:                PlatformGrok,
+		RequestedModel:          "grok-4.5",
+		StickyWeighted:          true,
+		StickyPreviousAccountID: 38000,
+	})
+
+	require.Nil(t, selection)
+	require.ErrorIs(t, err, dependencyErr)
+	require.Contains(t, err.Error(), "weighted sticky account refresh failed")
 }
 
 func TestOpenAIGatewayService_SelectAccountWithScheduler_StickyWeightedFallbackSkipsOutOfGroupStickyAccount(t *testing.T) {

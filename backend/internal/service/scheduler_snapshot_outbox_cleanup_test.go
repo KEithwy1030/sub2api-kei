@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/stretchr/testify/require"
 )
 
 type outboxCleanupCache struct {
@@ -744,6 +745,22 @@ func TestSchedulerSnapshotServicePollOutboxEmptyBatchClearsDegradedEpisode(t *te
 	if cache.listBucketCalls != 2 {
 		t.Fatalf("expected empty-poll recovery to rearm the next degraded episode, got %d attempts", cache.listBucketCalls)
 	}
+}
+
+func TestSchedulerSnapshotServiceEmptyOutboxDoesNotTrustFailedStartupRebuild(t *testing.T) {
+	rebuildErr := errors.New("startup rebuild unavailable")
+	cache := &outboxCleanupCache{listBucketErr: rebuildErr}
+	svc := NewSchedulerSnapshotService(cache, &outboxCleanupRepo{}, nil, nil, &config.Config{RunMode: config.RunModeSimple})
+	svc.snapshotSyncUntrusted.Store(true)
+
+	svc.runInitialRebuild()
+	require.True(t, svc.snapshotSyncUntrusted.Load())
+	require.False(t, svc.snapshotBaselineTrusted.Load())
+
+	svc.pollOutbox()
+
+	require.True(t, svc.snapshotSyncUntrusted.Load(), "an empty outbox cannot make a failed startup snapshot authoritative")
+	require.False(t, svc.snapshotBaselineTrusted.Load())
 }
 
 func TestSchedulerSnapshotServiceOutboxLagWarningIsTransitionLimited(t *testing.T) {

@@ -26,7 +26,10 @@ const (
 	openAIAdvancedSchedulerSettingKey          = "openai_advanced_scheduler_enabled"
 )
 
-var ErrOpenAISelectionProbeBudgetExhausted = errors.New("scheduler account probe budget exhausted")
+var (
+	ErrOpenAISelectionProbeBudgetExhausted        = errors.New("scheduler account probe budget exhausted")
+	ErrOpenAIAdvancedSchedulerSettingsUnavailable = errors.New("advanced scheduler settings unavailable")
+)
 
 const (
 	openAIAdvancedSchedulerSettingCacheTTL  = 5 * time.Second
@@ -63,6 +66,7 @@ type openAIAdvancedSchedulerRuntimeSettings struct {
 	subscriptionPriorityEnabled    bool
 	lbTopKOverride                 int
 	weightOverrides                map[string]float64
+	loadErr                        error
 }
 
 var openAIAdvancedSchedulerSettingCache atomic.Value // *cachedOpenAIAdvancedSchedulerSetting
@@ -1301,7 +1305,13 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 			}
 		}
 		account, err := s.service.getSchedulableAccount(ctx, accountID)
-		if err != nil || account == nil {
+		if err != nil {
+			if errors.Is(err, ErrAccountNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("scheduler weighted sticky account refresh failed for account %d: %w", accountID, err)
+		}
+		if account == nil {
 			continue
 		}
 		if !s.isAccountRequestCompatible(ctx, account, req) || !s.isAccountTransportCompatible(account, req.RequiredTransport) {
@@ -1920,10 +1930,31 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 				// 而静默丢弃管理员配置的覆盖值；降级状态会被缓存一个 TTL，必须留痕。
 				slog.Warn("openai_advanced_scheduler_settings_batch_load_failed", "error", err)
 				fallbackValues := make(map[string]string)
+				var enabledSettingErr error
 				for _, key := range openAIAdvancedSchedulerRuntimeSettingKeys() {
 					if value, valueErr := repo.GetValue(dbCtx, key); valueErr == nil {
 						fallbackValues[key] = value
+					} else if key == openAIAdvancedSchedulerSettingKey && !errors.Is(valueErr, ErrSettingNotFound) {
+						enabledSettingErr = valueErr
 					}
+				}
+				if enabledSettingErr != nil {
+					if cached, ok := openAIAdvancedSchedulerSettingCache.Load().(*cachedOpenAIAdvancedSchedulerSetting); ok && cached != nil {
+						slog.Warn("openai_advanced_scheduler_settings_using_stale_cache", "error", enabledSettingErr)
+						return openAIAdvancedSchedulerRuntimeSettings{
+							lowUpstreamRatePriorityEnabled: cached.lowUpstreamRatePriorityEnabled,
+							oauthSchedulingRateMultiplier:  cached.oauthSchedulingRateMultiplier,
+							enabled:                        cached.enabled,
+							stickyWeightedEnabled:          cached.stickyWeightedEnabled,
+							subscriptionPriorityEnabled:    cached.subscriptionPriorityEnabled,
+							lbTopKOverride:                 cached.lbTopKOverride,
+							weightOverrides:                cloneOpenAIAdvancedSchedulerWeightOverrides(cached.weightOverrides),
+						}, nil
+					}
+					return openAIAdvancedSchedulerRuntimeSettings{
+						oauthSchedulingRateMultiplier: defaultOpenAIOAuthSchedulingRateMultiplier,
+						loadErr:                       fmt.Errorf("%w: %v", ErrOpenAIAdvancedSchedulerSettingsUnavailable, enabledSettingErr),
+					}, nil
 				}
 				lowUpstreamRatePriorityEnabled = strings.EqualFold(strings.TrimSpace(fallbackValues[SettingKeyOpenAILowUpstreamRatePriorityEnabled]), "true")
 				oauthSchedulingRateMultiplier = parseOpenAIOAuthSchedulingRateMultiplier(fallbackValues[SettingKeyOpenAIOAuthSchedulingRateMultiplier])
@@ -2061,7 +2092,14 @@ func (s *OpenAIGatewayService) getOpenAIAccountScheduler(ctx context.Context) Op
 	if s == nil {
 		return nil
 	}
-	if !s.isOpenAIAdvancedSchedulerEnabled(ctx) {
+	return s.getOpenAIAccountSchedulerWithSettings(s.openAIAdvancedSchedulerRuntimeSettings(ctx))
+}
+
+func (s *OpenAIGatewayService) getOpenAIAccountSchedulerWithSettings(settings openAIAdvancedSchedulerRuntimeSettings) OpenAIAccountScheduler {
+	if s == nil {
+		return nil
+	}
+	if !settings.enabled {
 		return nil
 	}
 	s.openaiSchedulerOnce.Do(func() {
@@ -2154,7 +2192,11 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 	ctx = s.withOpenAIQuotaAutoPauseContext(ctx)
 	platform = normalizeOpenAICompatiblePlatform(platform)
 	decision := OpenAIAccountScheduleDecision{}
-	scheduler := s.getOpenAIAccountScheduler(ctx)
+	settings := s.openAIAdvancedSchedulerRuntimeSettings(ctx)
+	if platform == PlatformGrok && settings.loadErr != nil {
+		return nil, decision, settings.loadErr
+	}
+	scheduler := s.getOpenAIAccountSchedulerWithSettings(settings)
 	if scheduler == nil {
 		decision.Layer = openAIAccountScheduleLayerLoadBalance
 		if requiredTransport == OpenAIUpstreamTransportAny || requiredTransport == OpenAIUpstreamTransportHTTPSSE {
@@ -2222,8 +2264,8 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 			stickyAccountID = accountID
 		}
 	}
-	stickyWeighted := s.isOpenAIAdvancedSchedulerStickyWeightedEnabled(ctx)
-	subscriptionPriority := s.isOpenAIAdvancedSchedulerSubscriptionPriorityEnabled(ctx)
+	stickyWeighted := settings.enabled && settings.stickyWeightedEnabled
+	subscriptionPriority := settings.enabled && settings.subscriptionPriorityEnabled
 	stickyPreviousAccountID := int64(0)
 	if stickyWeighted && previousResponseCanMove && strings.TrimSpace(previousResponseID) != "" && platform == PlatformOpenAI {
 		stickyPreviousAccountID = s.ResolveAccountIDByPreviousResponseIDForScheduler(ctx, groupID, previousResponseID, requestedModel, excludedIDs, requiredCapability, requireCompact)

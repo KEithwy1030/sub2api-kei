@@ -138,6 +138,7 @@ type SchedulerSnapshotService struct {
 	outboxRebuildRetryReason     string
 	outboxLagWarningActive       bool
 	outboxMaxIDErrorLastLoggedAt time.Time
+	snapshotBaselineTrusted      atomic.Bool
 	snapshotSyncUntrusted        atomic.Bool
 
 	fullRebuildRunMu     sync.Mutex
@@ -174,7 +175,9 @@ func (s *SchedulerSnapshotService) Start() {
 		return
 	}
 	// Existing Redis snapshots have no freshness proof until this process has
-	// completed an outbox poll or a rebuild.
+	// completed a full rebuild. An empty outbox poll alone cannot prove that an
+	// existing snapshot contains the current authoritative account state.
+	s.snapshotBaselineTrusted.Store(false)
 	s.snapshotSyncUntrusted.Store(true)
 
 	s.wg.Add(1)
@@ -305,16 +308,16 @@ func (s *SchedulerSnapshotService) runInitialRebuild() {
 	if s.cache == nil {
 		return
 	}
-	_ = s.coalesceFullRebuild(func() error {
+	err := s.coalesceFullRebuild(func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		if err := s.rebuildFullSnapshot(ctx, "startup"); err != nil {
-			s.snapshotSyncUntrusted.Store(true)
 			logger.LegacyPrintf("service.scheduler_snapshot", "[Scheduler] rebuild startup failed: %v", err)
 			return err
 		}
 		return nil
 	})
+	s.recordFullRebuildTrust(err)
 }
 
 func (s *SchedulerSnapshotService) runOutboxWorker(interval time.Duration) {
@@ -374,7 +377,9 @@ func (s *SchedulerSnapshotService) pollOutbox() {
 		// Clear degraded/retry state without adding two more repository queries to
 		// the healthy one-second poll path.
 		s.clearOutboxDegradedEpisode()
-		s.snapshotSyncUntrusted.Store(false)
+		if s.snapshotBaselineTrusted.Load() {
+			s.snapshotSyncUntrusted.Store(false)
+		}
 		return
 	}
 
@@ -1005,11 +1010,25 @@ func (s *SchedulerSnapshotService) triggerFullRebuild(reason string) error {
 	if s.cache == nil {
 		return ErrSchedulerCacheNotReady
 	}
-	return s.coalesceFullRebuild(func() error {
+	err := s.coalesceFullRebuild(func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		return s.rebuildFullSnapshot(ctx, reason)
 	})
+	s.recordFullRebuildTrust(err)
+	return err
+}
+
+func (s *SchedulerSnapshotService) recordFullRebuildTrust(err error) {
+	if s == nil {
+		return
+	}
+	if err != nil {
+		s.snapshotSyncUntrusted.Store(true)
+		return
+	}
+	s.snapshotBaselineTrusted.Store(true)
+	s.snapshotSyncUntrusted.Store(false)
 }
 
 func (s *SchedulerSnapshotService) rebuildFullSnapshot(ctx context.Context, reason string) error {
@@ -1301,7 +1320,9 @@ func (s *SchedulerSnapshotService) checkOutboxLag(ctx context.Context, watermark
 	s.lagMu.Lock()
 	fullyRecovered := !lagDegraded && backlogKnown && !backlogDegraded
 	if fullyRecovered {
-		s.snapshotSyncUntrusted.Store(false)
+		if s.snapshotBaselineTrusted.Load() {
+			s.snapshotSyncUntrusted.Store(false)
+		}
 		s.lagFailures = 0
 		s.outboxRebuildLatched = false
 		s.outboxRebuildFailures = 0
