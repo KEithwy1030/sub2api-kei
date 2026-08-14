@@ -106,6 +106,7 @@ type ModelPricing struct {
 	LongContextInputThreshold          int     // 超过阈值后按整次会话提升输入价格
 	LongContextInputMultiplier         float64 // 长上下文整次会话输入倍率
 	LongContextOutputMultiplier        float64 // 长上下文整次会话输出倍率
+	LongContextThresholdInclusive      bool    // true 时达到阈值即应用长上下文价格
 	ImageOutputPricePerToken           float64 // 图片输出 token 价格 (USD)
 	ImageOutputPriceExplicit           bool    // 是否由渠道定价显式设定（为 true 时即使 == 0 也不回退）
 }
@@ -565,6 +566,18 @@ func (s *BillingService) initFallbackPricing() {
 		CacheReadPricePerToken: 0.5e-6,
 		SupportsCacheBreakdown: false,
 	}
+	// xAI Grok 4.6 (official docs: $2 input / $0.50 cached input / $6 output
+	// per MTok below 200K input tokens; long-context requests cost 2x).
+	s.fallbackPrices["grok-4.6"] = &ModelPricing{
+		InputPricePerToken:            2e-6,
+		OutputPricePerToken:           6e-6,
+		CacheReadPricePerToken:        0.5e-6,
+		SupportsCacheBreakdown:        false,
+		LongContextInputThreshold:     200000,
+		LongContextInputMultiplier:    2,
+		LongContextOutputMultiplier:   2,
+		LongContextThresholdInclusive: true,
+	}
 
 	// xAI Grok 4.3 (official docs: $1.25 input / $2.50 output per MTok)
 	s.fallbackPrices["grok-4.3"] = &ModelPricing{
@@ -761,6 +774,8 @@ func (s *BillingService) getFallbackPricing(model string) *ModelPricing {
 	}
 
 	switch modelLower {
+	case "grok-4.6":
+		return s.fallbackPrices["grok-4.6"]
 	case "grok", "grok-latest", "grok-4.5", "grok-4.5-latest", "grok-build-latest":
 		return s.fallbackPrices["grok-4.5"]
 	case "grok-4.3",
@@ -1214,6 +1229,9 @@ func (s *BillingService) shouldApplySessionLongContextPricing(tokens UsageTokens
 		return false
 	}
 	totalInputTokens := tokens.InputTokens + tokens.CacheCreationTokens + tokens.CacheReadTokens
+	if pricing.LongContextThresholdInclusive {
+		return totalInputTokens >= pricing.LongContextInputThreshold
+	}
 	return totalInputTokens > pricing.LongContextInputThreshold
 }
 

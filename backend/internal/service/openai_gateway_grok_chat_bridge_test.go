@@ -219,6 +219,8 @@ func TestGrokChatResponsesBridgeEligibility(t *testing.T) {
 func TestGrokChatResponsesRuntimeEligibility(t *testing.T) {
 	t.Parallel()
 	require.True(t, grokChatResponsesRuntimeEligible("grok-4.5", "isolated-id"))
+	require.True(t, grokChatResponsesRuntimeEligible("grok-4.6", "isolated-id"))
+	require.True(t, grokChatResponsesRuntimeEligible("xai/grok-4.6", "isolated-id"))
 	require.False(t, grokChatResponsesRuntimeEligible("grok-4.3", "isolated-id"))
 	require.False(t, grokChatResponsesRuntimeEligible("grok-4.5-build-free", "isolated-id"))
 	require.False(t, grokChatResponsesRuntimeEligible("grok-4.5", ""))

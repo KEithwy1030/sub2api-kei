@@ -196,7 +196,7 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 			return err
 		}
 	}
-	longContextBillingEnabled := billingAccount.IsOpenAILongContextBillingEnabled()
+	longContextBillingEnabled := billingAccount.IsOpenAILongContextBillingEnabled() || billingModelsContainGrok46(billingModels)
 	cost, err = s.calculateOpenAIRecordUsageCost(
 		ctx,
 		result,
@@ -455,6 +455,15 @@ func (s *OpenAIGatewayService) calculateOpenAIRecordUsageCost(
 
 func isGrokVideoBillingModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "grok-imagine-video")
+}
+
+func billingModelsContainGrok46(models []string) bool {
+	for _, model := range models {
+		if strings.EqualFold(strings.TrimSpace(model), "grok-4.6") {
+			return true
+		}
+	}
+	return false
 }
 
 func isGrokVideoUsageResult(result *OpenAIForwardResult, billingModels []string) bool {

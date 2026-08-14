@@ -496,7 +496,7 @@ func grokChatResponsesCacheIntentBody(body []byte) ([]byte, error) {
 }
 
 func grokChatResponsesRuntimeEligible(upstreamModel, cacheIdentity string) bool {
-	return strings.TrimSpace(upstreamModel) == "grok-4.5" && strings.TrimSpace(cacheIdentity) != ""
+	return grokModelUsesFlagshipResponsesCompatibility(upstreamModel) && strings.TrimSpace(cacheIdentity) != ""
 }
 
 // forwardGrokChatCompletionsViaResponses converts a strictly compatible Chat
@@ -527,7 +527,7 @@ func (s *OpenAIGatewayService) forwardGrokChatCompletionsViaResponses(
 	// for non-composer models, so they would be silently dropped. Route them to
 	// Responses even when no prompt-cache identity is available.
 	hasImageInput := openAIJSONValueMayContainImageInput(gjson.GetBytes(body, "messages"))
-	if !grokChatResponsesRuntimeEligible(upstreamModel, cacheIdentity) && (!hasImageInput || strings.TrimSpace(upstreamModel) != "grok-4.5") {
+	if !grokChatResponsesRuntimeEligible(upstreamModel, cacheIdentity) && (!hasImageInput || !grokModelUsesFlagshipResponsesCompatibility(upstreamModel)) {
 		return s.forwardAsRawChatCompletions(ctx, c, account, body, defaultMappedModel)
 	}
 

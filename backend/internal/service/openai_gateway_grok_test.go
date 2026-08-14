@@ -56,6 +56,7 @@ func TestPatchGrokResponsesBodySanitizesComposerReasoningParameters(t *testing.T
 		{name: "composer legacy alias", upstreamModel: "composer-2.5"},
 		{name: "provider-prefixed composer", upstreamModel: "xai/grok-composer-2.5-fast"},
 		{name: "grok 4.5", upstreamModel: "grok-4.5", wantReasoning: true},
+		{name: "grok 4.6", upstreamModel: "grok-4.6", wantReasoning: true},
 	}
 
 	body := []byte(`{
@@ -98,7 +99,7 @@ func TestExtractGrokResponsesReasoningEffortSupportsOpenAICompatibleField(t *tes
 	require.Equal(t, "high", *effort)
 }
 
-func TestPatchGrokResponsesBodyDropsGrok45ReasoningUnsupportedFields(t *testing.T) {
+func TestPatchGrokResponsesBodyDropsFlagshipUnsupportedFields(t *testing.T) {
 	t.Parallel()
 
 	body := []byte(`{
@@ -111,15 +112,33 @@ func TestPatchGrokResponsesBodyDropsGrok45ReasoningUnsupportedFields(t *testing.
 		"stop": ["done"]
 	}`)
 
-	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	for _, model := range []string{"grok-4.5", "grok-4.6"} {
+		model := model
+		t.Run(model, func(t *testing.T) {
+			t.Parallel()
+			patched, err := patchGrokResponsesBody(body, model)
+			require.NoError(t, err)
+			require.True(t, json.Valid(patched))
+			require.Equal(t, model, gjson.GetBytes(patched, "model").String())
+			require.False(t, gjson.GetBytes(patched, "presence_penalty").Exists())
+			require.False(t, gjson.GetBytes(patched, "presencePenalty").Exists())
+			require.False(t, gjson.GetBytes(patched, "frequency_penalty").Exists())
+			require.False(t, gjson.GetBytes(patched, "frequencyPenalty").Exists())
+			require.False(t, gjson.GetBytes(patched, "stop").Exists())
+		})
+	}
+}
+
+func TestBuildGrokResponsesRequestPreservesGrok46Model(t *testing.T) {
+	t.Parallel()
+
+	body, err := patchGrokResponsesBody([]byte(`{"model":"grok-4.5","input":"hello"}`), "grok-4.6")
 	require.NoError(t, err)
-	require.True(t, json.Valid(patched))
-	require.Equal(t, "grok-4.5", gjson.GetBytes(patched, "model").String())
-	require.False(t, gjson.GetBytes(patched, "presence_penalty").Exists())
-	require.False(t, gjson.GetBytes(patched, "presencePenalty").Exists())
-	require.False(t, gjson.GetBytes(patched, "frequency_penalty").Exists())
-	require.False(t, gjson.GetBytes(patched, "frequencyPenalty").Exists())
-	require.False(t, gjson.GetBytes(patched, "stop").Exists())
+	account := healthyGrokOAuthGatewayTestAccount(4600, "access-token")
+	req, err := buildGrokResponsesRequest(context.Background(), nil, account, body, "access-token", "cache-id", nil)
+	require.NoError(t, err)
+	require.Equal(t, "grok-4.6", gjson.GetBytes(body, "model").String())
+	require.Equal(t, "grok-4.6", req.Header.Get("X-Grok-Model-Override"))
 }
 
 func TestPatchGrokResponsesBodyKeepsPenaltyAndStopFieldsForNon45Models(t *testing.T) {

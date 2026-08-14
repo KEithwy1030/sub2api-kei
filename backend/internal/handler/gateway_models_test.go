@@ -101,7 +101,7 @@ func TestGatewayModels_GeminiGroupFallsBackToGeminiModels(t *testing.T) {
 	require.NotContains(t, modelIDsForTest(got.Data), "claude-sonnet-4-6")
 }
 
-func TestGatewayModels_Grok45AdvertisesReasoningEffortForGrokBuild(t *testing.T) {
+func TestGatewayModels_Grok45And46AdvertiseReasoningEffort(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	groupID := int64(4409)
@@ -113,7 +113,10 @@ func TestGatewayModels_Grok45AdvertisesReasoningEffortForGrokBuild(t *testing.T)
 						ID:       1,
 						Platform: service.PlatformGrok,
 						Credentials: map[string]any{
-							"model_mapping": map[string]any{"grok-4.5": "grok-4.5"},
+							"model_mapping": map[string]any{
+								"grok-4.5": "grok-4.5",
+								"grok-4.6": "grok-4.6",
+							},
 						},
 					},
 				},
@@ -133,22 +136,28 @@ func TestGatewayModels_Grok45AdvertisesReasoningEffortForGrokBuild(t *testing.T)
 	require.Equal(t, http.StatusOK, rec.Code)
 	var got gatewayModelsResponseForTest
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
-	require.ElementsMatch(t, []string{"grok-4.5"}, modelIDsForTest(got.Data))
-	var model gatewayModelItemForTest
-	for _, candidate := range got.Data {
-		if candidate.ID == "grok-4.5" {
-			model = candidate
-			break
+	require.ElementsMatch(t, []string{"grok-4.5", "grok-4.6"}, modelIDsForTest(got.Data))
+	for _, modelID := range []string{"grok-4.5", "grok-4.6"} {
+		var model gatewayModelItemForTest
+		for _, candidate := range got.Data {
+			if candidate.ID == modelID {
+				model = candidate
+				break
+			}
 		}
+		require.Equal(t, modelID, model.ID)
+		require.True(t, model.SupportsReasoningEffort)
+		require.Equal(t, "high", model.ReasoningEffort)
+		wantEfforts := []gatewayReasoningEffortOptionForTest{
+			{Value: "low", Label: "Low"},
+			{Value: "medium", Label: "Medium"},
+			{Value: "high", Label: "High", Default: true},
+		}
+		if modelID == "grok-4.6" {
+			wantEfforts = append(wantEfforts, gatewayReasoningEffortOptionForTest{Value: "xhigh", Label: "X-High"})
+		}
+		require.Equal(t, wantEfforts, model.ReasoningEfforts)
 	}
-	require.Equal(t, "grok-4.5", model.ID)
-	require.True(t, model.SupportsReasoningEffort)
-	require.Equal(t, "high", model.ReasoningEffort)
-	require.Equal(t, []gatewayReasoningEffortOptionForTest{
-		{Value: "low", Label: "Low"},
-		{Value: "medium", Label: "Medium"},
-		{Value: "high", Label: "High", Default: true},
-	}, model.ReasoningEfforts)
 }
 
 func TestGatewayModels_GeminiGroupFiltersMappedModelsByPlatform(t *testing.T) {

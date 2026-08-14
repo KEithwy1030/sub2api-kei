@@ -1105,6 +1105,45 @@ func TestGetModelPricing_Grok45OfficialFallback(t *testing.T) {
 	}
 }
 
+func TestGetModelPricing_Grok46OfficialFallback(t *testing.T) {
+	svc := newTestBillingService()
+
+	pricing, err := svc.GetModelPricing("grok-4.6")
+	require.NoError(t, err)
+	require.InDelta(t, 2e-6, pricing.InputPricePerToken, 1e-12)
+	require.InDelta(t, 6e-6, pricing.OutputPricePerToken, 1e-12)
+	require.InDelta(t, 0.5e-6, pricing.CacheReadPricePerToken, 1e-12)
+	require.Equal(t, 200000, pricing.LongContextInputThreshold)
+	require.InDelta(t, 2, pricing.LongContextInputMultiplier, 1e-12)
+	require.InDelta(t, 2, pricing.LongContextOutputMultiplier, 1e-12)
+	require.True(t, pricing.LongContextThresholdInclusive)
+	require.False(t, pricing.SupportsCacheBreakdown)
+}
+
+func TestCalculateCost_Grok46AppliesOfficialLongContextThreshold(t *testing.T) {
+	svc := newTestBillingService()
+
+	short, err := svc.calculateCostWithServiceTierPolicy(
+		"grok-4.6", UsageTokens{InputTokens: 199999, OutputTokens: 1}, 1, "", true,
+	)
+	require.NoError(t, err)
+	require.InDelta(t, 199999*2e-6, short.InputCost, 1e-9)
+	require.InDelta(t, 6e-6, short.OutputCost, 1e-12)
+
+	long, err := svc.calculateCostWithServiceTierPolicy(
+		"grok-4.6", UsageTokens{InputTokens: 200000, OutputTokens: 1}, 1, "", true,
+	)
+	require.NoError(t, err)
+	require.InDelta(t, 200000*4e-6, long.InputCost, 1e-9)
+	require.InDelta(t, 12e-6, long.OutputCost, 1e-12)
+}
+
+func TestBillingModelsContainGrok46(t *testing.T) {
+	require.True(t, billingModelsContainGrok46([]string{"grok", "grok-4.6"}))
+	require.True(t, billingModelsContainGrok46([]string{" GROK-4.6 "}))
+	require.False(t, billingModelsContainGrok46([]string{"grok-4.5"}))
+}
+
 func TestGetModelPricing_GrokCatalogFallbacks(t *testing.T) {
 	svc := newTestBillingService()
 
